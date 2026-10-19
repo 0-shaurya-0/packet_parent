@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from demo import dns_pair, make_demo, packet
+from traffic_fixtures import dns_pair, make_traffic, packet
 from packets import CaptureError, dns_name, frames, parse_capture, tls_sni
 from service import Store, category, day_bounds, estimate_sessions, matches, window_contains
 
@@ -35,8 +35,8 @@ def block(kind, body, endian='<'):
 
 
 class ParserTests(unittest.TestCase):
-    def test_demo_domain_evidence(self):
-        rows, stats = parse_capture(make_demo(day=DAY))
+    def test_capture_domain_evidence(self):
+        rows, stats = parse_capture(make_traffic(day=DAY))
         self.assertEqual(stats['packets'], 512)
         self.assertEqual(len(rows), 505)
         self.assertEqual({r['device_ip'] for r in rows}, {'192.168.1.20', '192.168.1.21'})
@@ -65,7 +65,7 @@ class ParserTests(unittest.TestCase):
             self.assertEqual(parse_capture(section+interface+record)[0][0]['device_ip'],'192.168.1.3')
 
     def test_truncated_capture_rejected(self):
-        for value in (b'not a capture',make_demo(day=DAY)[:-2],b'\xd4\xc3\xb2\xa1'):
+        for value in (b'not a capture',make_traffic(day=DAY)[:-2],b'\xd4\xc3\xb2\xa1'):
             with self.assertRaises(CaptureError):
                 parse_capture(value)
 
@@ -151,7 +151,14 @@ class StoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def load(self):
-        return self.store.import_capture(make_demo(day=DAY),'sample.pcap',True)
+        result = self.store.import_capture(make_traffic(day=DAY),'test.pcap')
+        if not self.store.snapshot()['rules']:
+            for name,kind,target,start,end,minutes in [
+                ('Gaming during study hours','category','Gaming','19:00','21:00',60),
+                ('Internet outside permitted hours','hours','','07:00','22:00',60),
+                ('Daily internet budget','budget','','','',60)]:
+                self.store.save_rule(dict(name=name,kind=kind,target=target,start=start,end=end,minutes=minutes,device_ip='',enabled=1))
+        return result
 
     def test_full_pipeline_expected_time_and_alerts(self):
         self.load(); snapshot=self.store.snapshot(DAY.isoformat())
@@ -163,14 +170,14 @@ class StoreTests(unittest.TestCase):
     def test_file_and_packet_deduplication(self):
         self.load()
         self.assertTrue(self.load()['duplicate'])
-        records=[(ts,frame) for ts,link,frame in frames(make_demo(day=DAY))]
-        result=self.store.import_capture(pcap(records,endian='>'),'reencoded.pcap',True)
+        records=[(ts,frame) for ts,link,frame in frames(make_traffic(day=DAY))]
+        result=self.store.import_capture(pcap(records,endian='>'),'reencoded.pcap')
         self.assertEqual(result['stats']['inserted'],0)
         self.assertEqual(self.store.snapshot()['summary']['observations'],505)
 
     def test_bad_import_does_not_partially_commit(self):
         with self.assertRaises(CaptureError):
-            self.store.import_capture(make_demo(day=DAY)[:-5],'broken.pcap')
+            self.store.import_capture(make_traffic(day=DAY)[:-5],'broken.pcap')
         with self.store.connect() as db:
             self.assertEqual(db.execute('SELECT COUNT(*) FROM captures').fetchone()[0],0)
             self.assertEqual(db.execute('SELECT COUNT(*) FROM events').fetchone()[0],0)
@@ -244,7 +251,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.client.get('/api/dashboard').status_code,401)
 
     def test_api_import_and_duplicate(self):
-        self.setup_parent();raw=make_demo(day=DAY)
+        self.setup_parent();raw=make_traffic(day=DAY)
         first=self.client.post('/api/captures?name=test.pcap',content=raw,headers=self.headers)
         self.assertEqual(first.status_code,200)
         self.assertEqual(first.json()['stats']['inserted'],505)
@@ -252,6 +259,17 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(second.json()['duplicate'])
         dashboard=self.client.get('/api/dashboard?day=2026-10-14&source=import').json()
         self.assertEqual(dashboard['summary']['domains'],7)
+
+    def test_no_sample_endpoints_or_controls(self):
+        self.setup_parent()
+        self.assertEqual(self.client.post('/api/demo',headers=self.headers).status_code,404)
+        self.assertEqual(self.client.get('/api/demo/download').status_code,404)
+        self.assertEqual(self.client.get('/api/dashboard?source=demo').status_code,400)
+        snapshot=self.client.get('/api/dashboard').json()
+        self.assertEqual(snapshot['summary']['observations'],0)
+        self.assertEqual(snapshot['rules'],[])
+        self.assertNotIn('Sample demo',self.client.get('/').text)
+        self.assertNotIn('Explore sample family',self.client.get('/static/app.js').text)
 
     def test_invalid_inputs_and_rule_validation(self):
         self.setup_parent()
@@ -262,21 +280,21 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.client.post('/api/rules',json={'name':'Bad','kind':'hours','start':'25:00','end':'05:00'},headers=self.headers).status_code,400)
 
     def test_device_rule_and_alert_workflow(self):
-        self.setup_parent();self.client.post('/api/demo',headers=self.headers)
-        self.assertEqual(self.client.put('/api/devices/192.168.1.20',json={'name':'Study laptop','child':'Aarav'},headers=self.headers).status_code,200)
+        self.setup_parent();self.client.post('/api/captures?name=test.pcap',content=make_traffic(day=DAY),headers=self.headers)
+        self.assertEqual(self.client.put('/api/devices/192.168.1.20',json={'name':'Study laptop','child':'Owner'},headers=self.headers).status_code,200)
         response=self.client.post('/api/rules',json={'name':'YouTube review','kind':'domain','target':'youtube.com'},headers=self.headers)
         self.assertEqual(response.status_code,200)
-        snapshot=self.client.get('/api/dashboard?source=demo').json()
+        snapshot=self.client.get('/api/dashboard?source=import&day=2026-10-14').json()
         alert=next(a for a in snapshot['alerts'] if a['title']=='YouTube review')
         self.client.post('/api/alerts/'+alert['id']+'/acknowledge',headers=self.headers)
-        self.assertTrue(next(a for a in self.client.get('/api/dashboard?source=demo').json()['alerts'] if a['id']==alert['id'])['acknowledged'])
+        self.assertTrue(next(a for a in self.client.get('/api/dashboard?source=import&day=2026-10-14').json()['alerts'] if a['id']==alert['id'])['acknowledged'])
 
     def test_completed_inbox_file_is_imported(self):
         self.setup_parent()
         original=self.module.INBOX
         inbox=Path(self.temp.name)/'inbox';inbox.mkdir()
         self.module.INBOX=inbox
-        (inbox/'finished.pcap').write_bytes(make_demo(day=DAY))
+        (inbox/'finished.pcap').write_bytes(make_traffic(day=DAY))
         stop=threading.Event()
         worker=threading.Thread(target=self.module.watcher,args=(stop,))
         mock_context = patch.object(self.module, 'capture_context', return_value={'id':'pc-test','name':'Test PC','ips':['192.168.1.20','192.168.1.21'],'macs':[]})

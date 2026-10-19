@@ -1,4 +1,4 @@
-"""Generate a small synthetic, structurally valid Ethernet/IPv4/UDP PCAP."""
+"""Isolated packet fixtures for automated tests; never loaded by the application."""
 import datetime as dt
 import ipaddress
 import struct
@@ -29,7 +29,7 @@ def dns_pair(device, domain, remote):
     return packet(device, '8.8.8.8', 52000, 53, query), packet('8.8.8.8', device, 53, 52000, answer)
 
 
-def make_demo(offset=330, day=None):
+def make_traffic(offset=330, day=None):
     tz = dt.timezone(dt.timedelta(minutes=offset))
     day = day or dt.datetime.now(tz).date()
     base = dt.datetime.combine(day, dt.time(), tz).timestamp()
@@ -49,8 +49,8 @@ def make_demo(offset=330, day=None):
         query, answer = dns_pair(device, domain, remote)
         records.extend([(start, query), (start + .01, answer)])
         for second in range(0, duration * 60 + 1, 30):
-            records.append((start + .1 + second, packet(device, remote, 53000, 443, b'SYNTHETIC_DEMO_' + b'x' * 90)))
-            records.append((start + .2 + second, packet(remote, device, 443, 53000, b'SYNTHETIC_DEMO_' + b'y' * 350)))
+            records.append((start + .1 + second, packet(device, remote, 53000, 443, b'TEST_TRAFFIC___' + b'x' * 90)))
+            records.append((start + .2 + second, packet(remote, device, 443, 53000, b'TEST_TRAFFIC___' + b'y' * 350)))
     records.sort(key=lambda item: item[0])
     output = bytearray(struct.pack('<IHHIIII', 0xa1b2c3d4, 2, 4, 0, 0, 65535, 1))
     for timestamp, frame in records:
@@ -58,9 +58,3 @@ def make_demo(offset=330, day=None):
         output.extend(struct.pack('<IIII', seconds, int((timestamp - seconds) * 1e6), len(frame), len(frame)))
         output.extend(frame)
     return bytes(output)
-
-
-if __name__ == '__main__':
-    from pathlib import Path
-    Path('sample-family.pcap').write_bytes(make_demo())
-    print('Created sample-family.pcap (synthetic traffic).')

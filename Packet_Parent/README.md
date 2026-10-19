@@ -11,7 +11,7 @@ A working local parental internet-activity monitoring prototype: **PCAP → meta
 5. Install Wireshark with TShark and Npcap for live monitoring. Choose **WiFi** (or your connected Ethernet adapter), then click **Start monitoring** in the dashboard.
 6. Browse normally. Completed segments appear automatically, usually within 15 seconds. Click **Stop monitoring** to stop capture.
 
-The default **This PC · live** view shows real local activity for today. **Imported captures** and **Sample demo** are separate views. Choose yesterday in the date filter to see earlier history. Opening the Wireshark GUI alone does not feed this dashboard.
+The default **This PC · live** view shows real local activity for today. **Imported captures** is a separate view for files you import yourself. There is no sample-data mode, preloaded activity, or preloaded family rules. Choose yesterday in the date filter to see earlier history. Opening the Wireshark GUI alone does not feed this dashboard.
 
 The application binds only to this computer's loopback interface. Keep its terminal running. Press Ctrl+C in that terminal to stop it. If port 8765 is already in use, stop the other PacketParent server before launching this copy. Use one server and one capture helper at a time.
 
@@ -41,24 +41,8 @@ No frontend build, external fonts, cloud account, or third-party web service is 
 - Dashboard Start/Stop monitoring controls, sensor status, and automatic completed-file ingestion.
 - Five-second dashboard refresh, including Devices when you are not editing a device form.
 - Persistent local PC identity across IP changes; filtering by local network addresses/MACs.
-- Separate live, imported, and sample views; multicast discovery traffic excluded.
+- Separate live and imported views; multicast discovery traffic excluded.
 - Configurable session threshold, fixed UTC offset, and background-domain exclusions.
-
-## Try the demonstration
-
-**Explore sample family** generates a synthetic Ethernet/IPv4/UDP capture and sends it through the same parser and database workflow used for uploaded files. The sample contains no real personal data. It represents traffic timing and DNS observations; the UDP payloads are synthetic rather than a replay of real encrypted applications.
-
-Two example devices appear:
-
-| Device | Expected estimated internet-active time |
-|---|---:|
-| Aarav's laptop | About 76 minutes |
-| Maya's tablet | About 35 minutes |
-| Combined device time | About 111 minutes |
-
-The sample contains overlapping education traffic: it is counted once per device. It seeds three example rules only when no rules already exist. On a fresh workspace, expect three alerts: gaming during study hours, activity after permitted hours, and Aarav's daily time limit. The sample contains a full synthetic day, including events later than the current clock time.
-
-`sample-family.pcap` is also included. Run `python demo.py` to regenerate it for the current day. Re-importing an identical file does not duplicate activity.
 
 ## What internet-active time means
 
@@ -96,8 +80,8 @@ The dashboard distinguishes the inbox watcher from a running capture sensor. Sho
 
 ```text
 Uploaded PCAP/PCAPNG ─┐
-Completed inbox file ─┼─> packets.py ─> service.py ─> SQLite
-Generated demo PCAP ─┘                    │              │
+Completed inbox file ─┘─> packets.py ─> service.py ─> SQLite
+                                         │              │
                                   Categorize / rules     │
                                                         ▼
                                              app.py (FastAPI)
@@ -110,7 +94,6 @@ Generated demo PCAP ─┘                    │              │
 | `app.py` | HTTP routes, parent sessions, upload handling, inbox watcher |
 | `packets.py` | Capture-format parsing and observable network metadata |
 | `service.py` | Database, category matching, internet sessions, rules, alerts |
-| `demo.py` | Deterministic synthetic capture generator for each date |
 | `capture.py`, `capture_agent.py` | TShark segment capture and process lifecycle |
 | `local_monitor.py` | Shared data path, stable PC identity, adapter discovery, status |
 | `repair_history.py` | Backed-up repair of matching legacy local captures |
@@ -159,4 +142,8 @@ For another local port:
 python -m uvicorn app:app --host 127.0.0.1 --port 8766
 ```
 
-Live regression tests additionally cover multicast exclusion, IP changes, other-device rejection, cross-segment DNS expiry, source isolation, empty segments, and backed-up history repair.
+Live regression tests additionally cover multicast exclusion, IP changes, other-device rejection, cross-segment DNS expiry, source isolation, empty segments, backed-up history repair, and removal of legacy sample records.
+
+## Existing sample records
+
+On startup, older captures explicitly marked as synthetic demo data are removed from the active database after a SQLite backup is saved in `data/backups`. Their observations, alerts, and unused device entries are removed too. The original three untouched sample rules are removed when their complete original set is identifiable. Custom or edited rules are preserved. Real captures, passwords, settings, and device names you entered are preserved. A real device that shared a sample IP keeps its observations; its unchanged sample label is reset. Automated packet fixtures live only under `tests/` and cannot populate the dashboard.

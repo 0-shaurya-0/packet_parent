@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from test_packetparent import BASE, DAY, pcap
-from demo import dns_pair, make_demo, packet
+from traffic_fixtures import dns_pair, make_traffic, packet
 from packets import parse_capture
 from repair_history import repair
 from service import Store
@@ -46,19 +46,19 @@ class LiveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             store = Store(Path(root)/'test.sqlite3')
             store.register_local(PC)
-            store.import_capture(make_demo(day=DAY), 'sample', True)
+            store.import_capture(make_traffic(day=DAY), 'test.pcap')
             empty = store.import_capture(pcap([]), 'empty', monitored=PC)
             self.assertEqual(empty['stats']['inserted'], 0)
             live = store.snapshot(DAY.isoformat(), source='live')
             self.assertEqual([d['ip'] for d in live['devices']], ['pc-test'])
             self.assertEqual(live['summary']['observations'], 0)
             self.assertEqual(live['alerts'], [])
-            self.assertEqual(store.snapshot(DAY.isoformat(), source='demo')['summary']['observations'], 505)
+            self.assertEqual(store.snapshot(DAY.isoformat(), source='import')['summary']['observations'], 505)
             raw = pcap([(BASE,packet('192.168.1.3','8.8.4.4',50000,443,b'hello'))])
             store.import_capture(raw,'live',monitored=PC)
             store.import_capture(raw,'manual',source='import')
             self.assertEqual(store.snapshot(DAY.isoformat(), source='live')['summary']['observations'], 1)
-            self.assertEqual(store.snapshot(DAY.isoformat(), source='import')['summary']['observations'], 1)
+            self.assertEqual(store.snapshot(DAY.isoformat(), source='import')['summary']['observations'], 506)
 
     def test_repair_preserves_metadata_and_backs_up(self):
         with tempfile.TemporaryDirectory() as directory:

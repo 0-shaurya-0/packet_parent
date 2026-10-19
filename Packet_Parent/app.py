@@ -14,12 +14,11 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from demo import make_demo
 from packets import CaptureError, clean_domain
 from service import CATEGORIES, Store
 from local_monitor import capture_context, data_directory, interfaces, read_status, write_status
@@ -276,17 +275,6 @@ async def upload(request: Request, name: str = 'capture.pcap', source: str = 'im
         return await run_in_threadpool(store.import_capture, data, Path(name).name, monitored=capture_context(DATA) if source == 'live' else None)
     except CaptureError as exc:
         raise HTTPException(400, str(exc))
-
-
-@app.post('/api/demo')
-def demo():
-    return store.import_capture(make_demo(store.settings()['utc_offset']), 'Sample family · synthetic.pcap', True)
-
-
-@app.get('/api/demo/download')
-def download_demo():
-    return Response(make_demo(store.settings()['utc_offset']), media_type='application/vnd.tcpdump.pcap',
-                    headers={'Content-Disposition': 'attachment; filename="sample-family.pcap"'})
 
 
 def validated_rule(data):

@@ -4,7 +4,7 @@ import json
 import sqlite3
 import threading
 from collections import Counter, defaultdict
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 from packets import CaptureError, clean_domain, parse_capture
@@ -95,6 +95,40 @@ class Store:
                 db.execute('UPDATE events SET source_ip=device_ip')
             if 'source' not in {r[1] for r in db.execute('PRAGMA table_info(alerts)')}:
                 db.execute("ALTER TABLE alerts ADD COLUMN source TEXT NOT NULL DEFAULT 'import'")
+        self.remove_legacy_samples()
+
+    def remove_legacy_samples(self):
+        """Remove only positively marked legacy samples, keeping a recoverable backup."""
+        with self.lock, self.connect() as db:
+            sample_ids = [r[0] for r in db.execute("SELECT id FROM captures WHERE demo=1 OR source='demo'")]
+            if not sample_ids:
+                return
+            backup_dir = Path(self.path).parent / 'backups'
+            backup_dir.mkdir(exist_ok=True)
+            backup = backup_dir / ('before-sample-cleanup-' + dt.datetime.now().strftime('%Y%m%d-%H%M%S-%f') + '.sqlite3')
+            with closing(sqlite3.connect(backup)) as destination:
+                db.backup(destination)
+            sample_devices = {r[0] for r in db.execute("SELECT DISTINCT device_ip FROM events WHERE capture_id IN (SELECT id FROM captures WHERE demo=1 OR source='demo')")}
+            defaults = [
+                (1, 'Gaming during study hours', 'category', 'Gaming', '19:00', '21:00', 60, '', 1),
+                (2, 'Internet outside permitted hours', 'hours', '', '07:00', '22:00', 60, '', 1),
+                (3, 'Daily internet budget', 'budget', '', '', '', 60, '', 1)]
+            first_rules = [tuple(r) for r in db.execute('SELECT id,name,kind,target,start,end,minutes,device_ip,enabled FROM rules WHERE id IN (1,2,3) ORDER BY id')]
+            if first_rules == defaults:
+                db.execute('DELETE FROM alerts WHERE rule_id IN (1,2,3)')
+                db.execute('DELETE FROM rules WHERE id IN (1,2,3)')
+            db.execute("DELETE FROM events WHERE capture_id IN (SELECT id FROM captures WHERE demo=1 OR source='demo')")
+            db.execute("DELETE FROM captures WHERE demo=1 OR source='demo'")
+            self.rebuild_alerts(db)
+            for ip in sample_devices:
+                in_use = db.execute('SELECT 1 FROM events WHERE device_ip=? UNION ALL SELECT 1 FROM rules WHERE device_ip=? LIMIT 1', (ip, ip)).fetchone()
+                if not in_use:
+                    db.execute('DELETE FROM devices WHERE ip=?', (ip,))
+                else:
+                    # A real imported device may have shared an example IP address.
+                    db.execute("""UPDATE devices SET name=?,child='' WHERE ip=? AND
+                        ((name='Aarav’s laptop' AND child='Aarav') OR (name='Maya’s tablet' AND child='Maya'))""", ('Device ' + ip, ip))
+            db.execute('INSERT OR REPLACE INTO config VALUES (?,?)', ('sample_cleanup_backup', str(backup)))
 
     def register_local(self, info):
         with self.lock, self.connect() as db:
@@ -135,8 +169,10 @@ class Store:
             settings['utc_offset'] = offset
             db.execute("UPDATE config SET value=? WHERE key='settings'", (json.dumps(settings),))
 
-    def import_capture(self, data, name, demo=False, monitored=None, source=None):
-        source = source or ('demo' if demo else 'live' if monitored else 'import')
+    def import_capture(self, data, name, monitored=None, source=None):
+        source = source or ('live' if monitored else 'import')
+        if source not in ('live', 'import'):
+            raise ValueError('Only your live or imported captures are supported.')
         if source == 'live' and not monitored:
             raise ValueError('Local capture requires this PC’s identity.')
         digest = hashlib.sha256(source.encode() + b'\0' + data).hexdigest()
@@ -149,7 +185,7 @@ class Store:
             with self.connect() as db:
                 cur = db.execute('INSERT INTO captures(hash,name,imported,first,last,stats,demo,source) VALUES(?,?,?,?,?,?,?,?)',
                                  (digest, name[:180], dt.datetime.now().timestamp(), min((r['timestamp'] for r in rows), default=None),
-                                  max((r['timestamp'] for r in rows), default=None), '{}', int(demo), source))
+                                  max((r['timestamp'] for r in rows), default=None), '{}', 0, source))
                 capture_id, inserted = cur.lastrowid, 0
                 for row in rows:
                     ip = row['device_ip']
@@ -162,14 +198,6 @@ class Store:
                 stats['inserted'] = inserted
                 stats['duplicates'] = len(rows) - inserted
                 db.execute('UPDATE captures SET stats=? WHERE id=?', (json.dumps(stats), capture_id))
-                if demo:
-                    db.execute("UPDATE devices SET name='Aarav’s laptop',child='Aarav' WHERE ip='192.168.1.20' AND name LIKE 'Device %'")
-                    db.execute("UPDATE devices SET name='Maya’s tablet',child='Maya' WHERE ip='192.168.1.21' AND name LIKE 'Device %'")
-                    if not db.execute('SELECT 1 FROM rules').fetchone():
-                        db.executemany('INSERT INTO rules(name,kind,target,start,end,minutes) VALUES(?,?,?,?,?,?)', [
-                            ('Gaming during study hours', 'category', 'Gaming', '19:00', '21:00', 60),
-                            ('Internet outside permitted hours', 'hours', '', '07:00', '22:00', 60),
-                            ('Daily internet budget', 'budget', '', '', '', 60)])
                 self.rebuild_alerts(db)
             return {'duplicate': False, 'id': capture_id, 'stats': stats, 'message': f'Imported {inserted:,} observations.'}
 
@@ -260,7 +288,7 @@ class Store:
             self.rebuild_alerts(db)
 
     def snapshot(self, day=None, device='', source='all'):
-        if source not in ('all', 'live', 'import', 'demo'):
+        if source not in ('all', 'live', 'import'):
             raise ValueError('Invalid activity source.')
         with self.connect() as db:
             settings = self.settings(db)

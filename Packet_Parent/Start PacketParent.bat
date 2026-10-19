@@ -1,6 +1,6 @@
 @echo off
 cd /d "%~dp0"
-python -c "import fastapi, uvicorn" >nul 2>&1
+python -c "import fastapi, uvicorn, psutil" >nul 2>&1
 if errorlevel 1 (
   echo Installing PacketParent dependencies...
   python -m pip install -r requirements.txt

@@ -6,6 +6,12 @@ import struct
 from collections import Counter
 
 
+def internet_address(value):
+    address = ipaddress.ip_address(value)
+    # is_global alone is True for many multicast groups in Python.
+    return address.is_global and not address.is_multicast and not address.is_unspecified and not address.is_loopback
+
+
 class CaptureError(ValueError):
     pass
 
@@ -181,6 +187,8 @@ def transport(frame, link):
                 return None
             typ = int.from_bytes(frame[pos + 2:pos + 4], 'big')
             pos += 4
+        if typ not in (0x0800, 0x86dd):
+            return None
         p = frame[pos:]
     elif link in (101, 228, 229):
         p = frame
@@ -237,14 +245,26 @@ def is_local(value):
     return any(addr in net for net in LOCAL if addr.version == net.version)
 
 
-def parse_capture(data):
-    rows, stats, cache, flows = [], Counter(), {}, {}
+def parse_capture(data, monitored=None, state=None):
+    state = state if state is not None else {}
+    rows, stats = [], Counter()
+    cache, flows = state.setdefault('dns', {}), state.setdefault('flows', {})
+    known_ips = set(monitored.get('ips', [])) if monitored else set()
+    known_macs = set(monitored.get('macs', [])) if monitored else set()
     packets = []
     for record in frames(data):
         if len(packets) >= 150_000:
             raise CaptureError('Capture has more than 150,000 packets. Split it into smaller files.')
         packets.append(record)
     packets.sort(key=lambda x: x[0])
+    if packets:
+        first_time = packets[0][0]
+        for key in list(cache):
+            if cache[key][1] < first_time:
+                del cache[key]
+        for key in list(flows):
+            if first_time - flows[key][2] > 300:
+                del flows[key]
     supported = {0, 1, 101, 113, 228, 229, 276}
     for ts, link, frame in packets:
         stats['packets'] += 1
@@ -260,13 +280,23 @@ def parse_capture(data):
                 stats['unsupported_or_non_ip'] += 1
                 continue
             src, dst, sport, dport, proto, payload = decoded
-            outbound = is_local(src) and not is_local(dst)
-            inbound = is_local(dst) and not is_local(src)
+            src_mac = frame[6:12].hex(':') if link == 1 else ''
+            dst_mac = frame[:6].hex(':') if link == 1 else ''
+            src_owned = (src in known_ips or src_mac in known_macs) if monitored else is_local(src)
+            dst_owned = (dst in known_ips or dst_mac in known_macs) if monitored else is_local(dst)
+            if monitored and not (src_owned or dst_owned):
+                stats['other_device_packets'] += 1
+                continue
+            if ipaddress.ip_address(dst).is_multicast or ipaddress.ip_address(src).is_multicast:
+                stats['multicast_packets'] += 1
+                continue
+            outbound = src_owned and not dst_owned
+            inbound = dst_owned and not src_owned
             is_dns = proto == 'UDP' and (sport == 53 or dport == 53)
             if is_dns:
                 response, names, answers = dns_metadata(payload)
                 device = dst if response else src
-                if not is_local(device):
+                if not (dst_owned if response else src_owned):
                     continue
                 if response:
                     for ip, name, ttl in answers:
@@ -280,7 +310,7 @@ def parse_capture(data):
                 if not (outbound or inbound) or not payload:
                     continue
                 device, remote = (src, dst) if outbound else (dst, src)
-                if not ipaddress.ip_address(remote).is_global:
+                if not internet_address(remote):
                     continue
                 local_port, remote_port = (sport, dport) if outbound else (dport, sport)
                 if remote_port in (53, 67, 68, 123, 137, 138, 5353, 5355):
@@ -307,7 +337,8 @@ def parse_capture(data):
                         domain, evidence = name, 'DNS-to-IP inference'
                 active = True
             fingerprint = hashlib.sha256(struct.pack('!d', ts) + frame).hexdigest()
-            rows.append({'fingerprint': fingerprint, 'timestamp': ts, 'device_ip': device,
+            rows.append({'fingerprint': fingerprint, 'timestamp': ts, 'device_ip': monitored['id'] if monitored else device,
+                         'source_ip': device,
                          'remote_ip': remote, 'domain': domain, 'protocol': proto,
                          'evidence': evidence, 'active': int(active), 'bytes': len(payload)})
         except (ValueError, IndexError, struct.error):

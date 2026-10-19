@@ -8,25 +8,30 @@ import re
 import secrets
 import threading
 import time
+import subprocess
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from demo import make_demo
 from packets import CaptureError, clean_domain
 from service import CATEGORIES, Store
+from local_monitor import capture_context, data_directory, interfaces, read_status, write_status
 
 ROOT = Path(__file__).resolve().parent
-DATA = Path(os.environ.get('PACKETPARENT_DATA', str(ROOT / 'data')))
+DATA = data_directory()
 DATA.mkdir(parents=True, exist_ok=True)
 INBOX = DATA / 'inbox'
 INBOX.mkdir(exist_ok=True)
 store = Store(DATA / 'packetparent.sqlite3')
+store.register_local(capture_context(DATA))
+monitor_process = None
+monitor_lock = threading.Lock()
 sessions, attempts = {}, {}
 watch_status = {'running': False, 'last_import': None, 'error': None}
 MAX_UPLOAD = 25 * 1024 * 1024
@@ -56,10 +61,16 @@ def watcher(stop):
                 if not previous or previous[0] != signature:
                     seen[str(path)] = (signature, False)
                     continue
-                seen[str(path)] = (signature, True)
                 if stat.st_size > MAX_UPLOAD:
                     raise ValueError('Capture exceeds 25 MB.')
-                result = store.import_capture(path.read_bytes(), path.name)
+                context = capture_context(DATA)
+                sidecar = path.with_suffix('.json')
+                if sidecar.exists():
+                    saved = json.loads(sidecar.read_text(encoding='utf-8'))
+                    if saved.get('id') == context['id']:
+                        context = saved
+                result = store.import_capture(path.read_bytes(), path.name, monitored=context)
+                seen[str(path)] = (signature, True)
                 if not result['duplicate']:
                     watch_status['last_import'] = time.time()
                 watch_status['error'] = None
@@ -76,6 +87,12 @@ async def lifespan(app):
     yield
     stop.set()
     worker.join(timeout=3)
+    if monitor_process and monitor_process.poll() is None:
+        (DATA / 'capture.stop').touch()
+        try:
+            await run_in_threadpool(monitor_process.wait, 5)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 app = FastAPI(title='PacketParent', docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
@@ -87,7 +104,7 @@ async def security(request, call_next):
     if request.url.path.startswith('/api/'):
         if request.method not in ('GET', 'HEAD') and request.headers.get('x-packetparent') != '1':
             return JSONResponse({'detail': 'Missing request protection header.'}, status_code=403)
-        public = ('/api/auth/status', '/api/auth/setup', '/api/auth/login')
+        public = ('/api/auth/status', '/api/auth/setup', '/api/auth/login', '/api/health')
         if request.url.path not in public:
             token = request.cookies.get('pp_session', '')
             expiry = sessions.get(token, 0)
@@ -191,35 +208,73 @@ def logout(request: Request):
 
 
 @app.get('/api/dashboard')
-def dashboard(day: str = '', device: str = ''):
+def dashboard(day: str = '', device: str = '', source: str = 'live'):
     try:
-        result = store.snapshot(day or None, device)
+        result = store.snapshot(day or None, device, source)
     except (ValueError, OverflowError):
         raise HTTPException(400, 'Use a valid date in YYYY-MM-DD format.')
     result['watcher'] = watch_status
+    result['monitor'] = read_status(DATA)
     return result
 
 
+@app.get('/api/health')
+def health():
+    return {'application': 'PacketParent', 'version': 2, 'data_dir': str(DATA)}
+
+
+@app.get('/api/monitor')
+def monitor():
+    try:
+        available, error = interfaces(), None
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        available, error = [], str(exc)
+    return {'status': read_status(DATA), 'interfaces': available, 'error': error, 'data_dir': str(DATA)}
+
+
+@app.post('/api/monitor/start')
+async def start_monitor(request: Request):
+    global monitor_process
+    data = await read_json(request)
+    selected = text_field(data, 'interface', 250)
+    def launch():
+        global monitor_process
+        with monitor_lock:
+            if (monitor_process and monitor_process.poll() is None) or read_status(DATA)['state'] in ('starting', 'recording'):
+                raise HTTPException(409, 'Monitoring is already running.')
+            try:
+                match = next((i for i in interfaces() if selected in (i['id'], i['name'])), None)
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                raise HTTPException(400, str(exc))
+            if not match:
+                raise HTTPException(400, 'Choose an available network adapter.')
+            (DATA / 'capture.stop').unlink(missing_ok=True)
+            with (DATA / 'capture-agent.log').open('w') as log:
+                monitor_process = subprocess.Popen([sys.executable, str(ROOT / 'capture.py'), '--managed', '--interface', match['name']],
+                    cwd=ROOT, env={**os.environ, 'PACKETPARENT_DATA': str(DATA)}, stdout=log, stderr=log,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+            write_status(DATA, {'state':'starting', 'pid':monitor_process.pid, 'interface':match['label'], 'error':None})
+            return {'ok': True}
+    return await run_in_threadpool(launch)
+
+
+@app.post('/api/monitor/stop')
+def stop_monitor():
+    (DATA / 'capture.stop').touch()
+    return {'ok': True}
+
+
 @app.post('/api/captures')
-async def upload(request: Request, name: str = 'capture.pcap'):
+async def upload(request: Request, name: str = 'capture.pcap', source: str = 'import'):
+    if source not in ('live', 'import'):
+        raise HTTPException(400, 'Choose live or imported captures.')
     if not name.lower().endswith(('.pcap', '.pcapng')):
         raise HTTPException(400, 'Choose a .pcap or .pcapng file.')
     data = await read_bytes(request, MAX_UPLOAD)
     try:
-        return await run_in_threadpool(store.import_capture, data, Path(name).name)
+        return await run_in_threadpool(store.import_capture, data, Path(name).name, monitored=capture_context(DATA) if source == 'live' else None)
     except CaptureError as exc:
         raise HTTPException(400, str(exc))
-
-
-@app.post('/api/demo')
-def demo():
-    return store.import_capture(make_demo(store.settings()['utc_offset']), 'Sample family · synthetic.pcap', True)
-
-
-@app.get('/api/demo/download')
-def download_demo():
-    return Response(make_demo(store.settings()['utc_offset']), media_type='application/vnd.tcpdump.pcap',
-                    headers={'Content-Disposition': 'attachment; filename="sample-family.pcap"'})
 
 
 def validated_rule(data):

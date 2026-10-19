@@ -5,11 +5,15 @@ A working local parental internet-activity monitoring prototype: **PCAP → meta
 ## Start on Windows
 
 1. Install Python 3.11 or newer if needed, with Python on PATH.
-2. Double-click **Start PacketParent.bat**. It installs FastAPI and Uvicorn only if they are missing.
+2. Double-click **Start PacketParent.bat**. It installs FastAPI, Uvicorn, and psutil if needed.
 3. Open **http://127.0.0.1:8765**.
-4. Create your own parent password, then click **Explore sample family**, or upload a `.pcap` / `.pcapng` file.
+4. Create your parent password, or sign in with your existing one.
+5. Install Wireshark with TShark and Npcap for live monitoring. Choose **WiFi** (or your connected Ethernet adapter), then click **Start monitoring** in the dashboard.
+6. Browse normally. Completed segments appear automatically, usually within 15 seconds. Click **Stop monitoring** to stop capture.
 
-The application binds only to this computer's loopback interface. Keep its terminal running. Press Ctrl+C in that terminal to stop it. If port 8765 is already serving the preview, use that running instance, or stop it before starting another instance.
+The default **This PC · live** view shows real local activity for today. **Imported captures** and **Sample demo** are separate views. Choose yesterday in the date filter to see earlier history. Opening the Wireshark GUI alone does not feed this dashboard.
+
+The application binds only to this computer's loopback interface. Keep its terminal running. Press Ctrl+C in that terminal to stop it. If port 8765 is already in use, stop the other PacketParent server before launching this copy. Use one server and one capture helper at a time.
 
 From a terminal in this folder:
 
@@ -34,7 +38,10 @@ No frontend build, external fonts, cloud account, or third-party web service is 
 - Daily estimated internet-time limits, evaluated independently per device.
 - Grouped, explainable alerts with a reviewed state.
 - Daily/device filters, hourly activity chart, category breakdown, activity history, and session details.
-- A five-second dashboard refresh and optional inbox ingestion.
+- Dashboard Start/Stop monitoring controls, sensor status, and automatic completed-file ingestion.
+- Five-second dashboard refresh, including Devices when you are not editing a device form.
+- Persistent local PC identity across IP changes; filtering by local network addresses/MACs.
+- Separate live, imported, and sample views; multicast discovery traffic excluded.
 - Configurable session threshold, fixed UTC offset, and background-domain exclusions.
 
 ## Try the demonstration
@@ -55,7 +62,7 @@ The sample contains overlapping education traffic: it is counted once per device
 
 ## What internet-active time means
 
-1. Extract timestamped TCP/UDP payload observations involving a recognized private device and an external address.
+1. Extract timestamped TCP/UDP payload observations involving this PC and a public unicast address. Generic imports instead recognize private source/destination IPs.
 2. Exclude DNS-only lookups, payload-free TCP packets, common infrastructure ports, and configured background domains.
 3. Sort and deduplicate activity timestamps per device.
 4. Group timestamps into sessions while adjacent observations are no more than the configured threshold apart (default: 120 seconds).
@@ -72,18 +79,18 @@ For the first experiment, run Wireshark on the monitored test device, select its
 
 Capturing on another ordinary laptop merely connected to the same Wi-Fi usually will not reveal the monitored device's traffic. A gateway capture must observe the LAN side before NAT to retain individual private IP addresses.
 
-### Optional continuous capture
+### Continuous capture
 
-Install Wireshark with TShark and the required capture driver/permissions. TShark is optional for uploads and is not bundled with this project.
+Install Wireshark with TShark and Npcap. Start/stop capture from the dashboard, or use the terminal commands below. TShark is optional for file uploads and is not bundled with this project.
 
 ```powershell
 python capture.py --list
 python capture.py --interface 1
 ```
 
-Replace `1` with the desired interface from the list. Keep the dashboard server running too. The helper captures ten-second segments, then moves completed files into `data/inbox`. The server watches that folder and automatically imports completed captures. Capture files remain there until you remove them. The helper's 512-byte snapshot limit reduces payload collection but can truncate hostname-bearing handshakes.
+Replace `1` with the desired interface from the list. Keep the dashboard server running too. The helper captures ten-second segments, then moves completed files into `data/inbox`. The server watches that folder and automatically imports completed captures. Capture files remain there until you remove them. The helper uses a 2,048-byte snapshot limit, a local MAC capture filter, and non-promiscuous mode. Segments are bounded by duration, file size, and packet count. Large or split handshakes may still be truncated. Stopping discards the unfinished segment; completed history is retained.
 
-The dashboard distinguishes the inbox watcher from a running capture sensor. Short capture gaps can occur while the helper restarts TShark between segments. This optional hardware-dependent flow has not been verified on a real capture interface in the development environment; TShark was not installed there. The inbox importer is tested separately with a completed synthetic capture.
+The dashboard distinguishes the inbox watcher from a running capture sensor. Short capture gaps can occur while the helper restarts TShark between segments. The local Windows WiFi → TShark → inbox → SQLite → dashboard flow was verified with a real capture. The helper reads the running dashboard’s data directory, and refuses an explicitly conflicting PACKETPARENT_DATA setting. Each data directory permits one sensor process at a time.
 
 ## Data and architecture
 
@@ -104,7 +111,9 @@ Generated demo PCAP ─┘                    │              │
 | `packets.py` | Capture-format parsing and observable network metadata |
 | `service.py` | Database, category matching, internet sessions, rules, alerts |
 | `demo.py` | Deterministic synthetic capture generator for each date |
-| `capture.py` | Optional TShark segment capture helper |
+| `capture.py`, `capture_agent.py` | TShark segment capture and process lifecycle |
+| `local_monitor.py` | Shared data path, stable PC identity, adapter discovery, status |
+| `repair_history.py` | Backed-up repair of matching legacy local captures |
 | `static/` | Responsive dashboard and API client |
 | `tests/test_packetparent.py` | Parser, estimator, persistence, and API tests |
 
@@ -112,7 +121,11 @@ SQLite tables: `config`, `devices`, `captures`, `events`, `rules`, and `alerts`.
 
 By default the database is `data/packetparent.sqlite3`. The `PACKETPARENT_DATA` environment variable can redirect runtime data, including the inbox, to a separate directory. Do not share runtime data or a configured database as part of the source package.
 
-The preview prepared during development uses a separate demo database and the password **PacketParent-demo-2026**. A fresh extracted source package has no configured password and asks you to create one.
+A fresh extracted source package has no configured password and asks you to create one. Existing passwords are preserved during an update. Keep `data/local-device.json` with your database: it holds this installation’s persistent device ID.
+
+### Repair older local history
+
+Stop monitoring and the server, then run `python repair_history.py` from the project folder. It reparses numeric helper-generated captures still present in `data/inbox`, matching this PC by its current adapter MAC addresses. It creates a SQLite backup in `data/backups`, preserves password/settings and custom device labels, and removes orphan device records after removing discovery traffic. Captures that cannot be attributed to this PC are left as imports. This command is repeatable; already repaired captures are skipped. MAC randomization or replacing an adapter may prevent old history from matching.
 
 ## Prototype boundaries
 
@@ -120,11 +133,11 @@ The preview prepared during development uses a separate demo database and the pa
 - No HTTPS decryption, full URL recovery from encrypted traffic, exact video identification, or browser extension.
 - DNS visibility can be reduced by encrypted DNS, cached DNS, VPNs, and encrypted ClientHello. Unknown IP connections remain visible and can contribute to the time estimate.
 - DNS-to-IP association can be ambiguous on shared infrastructure. The parser never labels it as confirmed page viewing.
-- Hostname inference is local to each imported capture; it is not carried across files. This particularly affects short continuous-capture segments.
+- Live DNS/flow inference is carried across segments while the server runs, with expiration. Generic imports have independent inference state. Restarting the server clears this temporary cache.
 - Supported link types: Ethernet (including VLAN), raw IPv4/IPv6, BSD loopback, Linux cooked v1/v2. PCAPNG supports enhanced packet blocks and per-interface timestamp resolution/offset. Export legacy or untimestamped blocks as classic PCAP.
-- Device discovery recognizes RFC1918 IPv4 ranges and IPv6 ULA addresses. Globally addressed IPv6 devices are not automatically attributed to a child.
+- Generic imports recognize RFC1918 IPv4 and IPv6 ULA devices. Live capture matches this PC by local addresses or Ethernet MAC, including public IPv6. Captures on virtual/tunnel adapters may require selecting the correct physical adapter.
 - No IP fragment or TCP stream reassembly. DNS over UDP, a complete visible TLS ClientHello within one packet, and HTTP Host within one packet are supported. Some captures therefore have less domain visibility.
-- Device identity uses captured local IP, not stable hardware identity. Reserve local IPs for a repeatable demo.
+- Live monitoring uses one persistent ID for this installation; imported gateway captures still use local IP identity. This is a single-PC sensor, not a router-wide discovery service.
 - Domain categories are a small editable code list, not a comprehensive content classification service. Background exclusions are also heuristic.
 - Day boundaries and rule schedules use a fixed UTC offset, initialized from the browser. Daylight saving adjustments are manual.
 - Capture timestamps establish when activity was observed; the system does not claim complete monitoring coverage or infer that missing data means offline time.
@@ -145,3 +158,5 @@ For another local port:
 ```powershell
 python -m uvicorn app:app --host 127.0.0.1 --port 8766
 ```
+
+Live regression tests additionally cover multicast exclusion, IP changes, other-device rejection, cross-segment DNS expiry, source isolation, empty segments, and backed-up history repair.

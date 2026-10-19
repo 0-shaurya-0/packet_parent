@@ -65,6 +65,7 @@ class Store:
     def __init__(self, path):
         self.path = str(path)
         self.lock = threading.RLock()
+        self.parser_state = {}
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
             db.executescript('''
@@ -86,6 +87,19 @@ class Store:
                 count INTEGER, acknowledged INTEGER NOT NULL DEFAULT 0);
             ''')
             db.execute('INSERT OR IGNORE INTO config VALUES (?,?)', ('settings', json.dumps(DEFAULT_SETTINGS)))
+            if 'source' not in {r[1] for r in db.execute('PRAGMA table_info(captures)')}:
+                db.execute("ALTER TABLE captures ADD COLUMN source TEXT NOT NULL DEFAULT 'import'")
+                db.execute("UPDATE captures SET source='demo' WHERE demo=1")
+            if 'source_ip' not in {r[1] for r in db.execute('PRAGMA table_info(events)')}:
+                db.execute("ALTER TABLE events ADD COLUMN source_ip TEXT NOT NULL DEFAULT ''")
+                db.execute('UPDATE events SET source_ip=device_ip')
+            if 'source' not in {r[1] for r in db.execute('PRAGMA table_info(alerts)')}:
+                db.execute("ALTER TABLE alerts ADD COLUMN source TEXT NOT NULL DEFAULT 'import'")
+
+    def register_local(self, info):
+        with self.lock, self.connect() as db:
+            db.execute('INSERT OR IGNORE INTO devices(ip,name) VALUES(?,?)', (info['id'], info['name']))
+            db.execute('INSERT OR REPLACE INTO config VALUES (?,?)', ('local_device', json.dumps(info)))
 
     @contextmanager
     def connect(self):
@@ -121,28 +135,30 @@ class Store:
             settings['utc_offset'] = offset
             db.execute("UPDATE config SET value=? WHERE key='settings'", (json.dumps(settings),))
 
-    def import_capture(self, data, name, demo=False):
-        digest = hashlib.sha256(data).hexdigest()
+    def import_capture(self, data, name, demo=False, monitored=None, source=None):
+        source = source or ('demo' if demo else 'live' if monitored else 'import')
+        if source == 'live' and not monitored:
+            raise ValueError('Local capture requires this PC’s identity.')
+        digest = hashlib.sha256(source.encode() + b'\0' + data).hexdigest()
         with self.lock:
             with self.connect() as db:
                 existing = db.execute('SELECT id FROM captures WHERE hash=?', (digest,)).fetchone()
                 if existing:
                     return {'duplicate': True, 'id': existing[0], 'message': 'This capture is already imported.'}
-            rows, stats = parse_capture(data)
-            if not rows:
-                raise CaptureError('No supported device activity found. Capture RFC1918/ULA device traffic with DNS or external TCP/UDP payloads. ' + json.dumps(stats))
+            rows, stats = parse_capture(data, monitored, self.parser_state if source == 'live' else None)
             with self.connect() as db:
-                cur = db.execute('INSERT INTO captures(hash,name,imported,first,last,stats,demo) VALUES(?,?,?,?,?,?,?)',
-                                 (digest, name[:180], dt.datetime.now().timestamp(), min(r['timestamp'] for r in rows),
-                                  max(r['timestamp'] for r in rows), '{}', int(demo)))
+                cur = db.execute('INSERT INTO captures(hash,name,imported,first,last,stats,demo,source) VALUES(?,?,?,?,?,?,?,?)',
+                                 (digest, name[:180], dt.datetime.now().timestamp(), min((r['timestamp'] for r in rows), default=None),
+                                  max((r['timestamp'] for r in rows), default=None), '{}', int(demo), source))
                 capture_id, inserted = cur.lastrowid, 0
                 for row in rows:
                     ip = row['device_ip']
-                    db.execute('INSERT OR IGNORE INTO devices(ip,name) VALUES(?,?)', (ip, 'Device ' + ip))
+                    db.execute('INSERT OR IGNORE INTO devices(ip,name) VALUES(?,?)', (ip, monitored['name'] if monitored else 'Device ' + ip))
+                    row['fingerprint'] = hashlib.sha256((source + ':' + row['fingerprint']).encode()).hexdigest()
                     values = [row[k] for k in ('fingerprint', 'device_ip', 'timestamp', 'remote_ip', 'domain', 'protocol', 'evidence', 'active', 'bytes')]
                     inserted += db.execute('''INSERT OR IGNORE INTO events(fingerprint,device_ip,timestamp,remote_ip,domain,
-                        protocol,evidence,active,bytes,capture_id,category) VALUES(?,?,?,?,?,?,?,?,?,?,?)''',
-                        values + [capture_id, category(row['domain'])]).rowcount
+                        protocol,evidence,active,bytes,capture_id,category,source_ip) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
+                        values + [capture_id, category(row['domain']), row['source_ip']]).rowcount
                 stats['inserted'] = inserted
                 stats['duplicates'] = len(rows) - inserted
                 db.execute('UPDATE captures SET stats=? WHERE id=?', (json.dumps(stats), capture_id))
@@ -158,9 +174,12 @@ class Store:
             return {'duplicate': False, 'id': capture_id, 'stats': stats, 'message': f'Imported {inserted:,} observations.'}
 
     def rebuild_alerts(self, db):
+        if not db.execute('SELECT 1 FROM rules WHERE enabled=1').fetchone():
+            db.execute('DELETE FROM alerts')
+            return
         settings = self.settings(db)
         tz = dt.timezone(dt.timedelta(minutes=settings['utc_offset']))
-        rows = [dict(r) for r in db.execute('SELECT * FROM events ORDER BY timestamp')]
+        rows = [dict(r) for r in db.execute('SELECT e.*,c.source FROM events e JOIN captures c ON c.id=e.capture_id ORDER BY timestamp')]
         rules = [dict(r) for r in db.execute('SELECT * FROM rules WHERE enabled=1')]
         old_ack = {r['id']: r['acknowledged'] for r in db.execute('SELECT id,acknowledged FROM alerts')}
         output, times = {}, defaultdict(list)
@@ -168,7 +187,7 @@ class Store:
             local = dt.datetime.fromtimestamp(row['timestamp'], tz)
             day, minute = local.date().isoformat(), local.hour * 60 + local.minute
             if active(row, settings):
-                times[row['device_ip']].append(row['timestamp'])
+                times[(row['source'], row['device_ip'])].append(row['timestamp'])
             for rule in rules:
                 if rule['kind'] == 'budget' or (rule['device_ip'] and rule['device_ip'] != row['device_ip']):
                     continue
@@ -182,15 +201,15 @@ class Store:
                     reason = f"Observed {row['domain']} matched the {rule['kind']} rule: {rule['target']}."
                 if not hit:
                     continue
-                key = hashlib.sha256(f"{rule['id']}|{row['device_ip']}|{day}|{row['domain'] or row['remote_ip']}".encode()).hexdigest()[:24]
+                key = hashlib.sha256(f"{row['source']}|{rule['id']}|{row['device_ip']}|{day}|{row['domain'] or row['remote_ip']}".encode()).hexdigest()[:24]
                 if key in output:
                     output[key]['count'] += 1
                     output[key]['last_seen'] = row['timestamp']
                 else:
                     output[key] = dict(id=key, rule_id=rule['id'], device_ip=row['device_ip'], day=day,
                         timestamp=row['timestamp'], last_seen=row['timestamp'], domain=row['domain'] or row['remote_ip'],
-                        title=rule['name'], reason=reason, evidence=row['evidence'], count=1)
-        for ip, timestamps in times.items():
+                        title=rule['name'], reason=reason, evidence=row['evidence'], count=1, source=row['source'])
+        for (source, ip), timestamps in times.items():
             totals, lasts = Counter(), {}
             for start, end in estimate_sessions(timestamps, settings['idle_seconds']):
                 cursor = start
@@ -207,13 +226,15 @@ class Store:
                 for day, seconds in totals.items():
                     if seconds <= rule['minutes'] * 60:
                         continue
-                    key = hashlib.sha256(f"{rule['id']}|{ip}|{day}|budget".encode()).hexdigest()[:24]
+                    key = hashlib.sha256(f"{source}|{rule['id']}|{ip}|{day}|budget".encode()).hexdigest()[:24]
                     output[key] = dict(id=key, rule_id=rule['id'], device_ip=ip, day=day, timestamp=lasts[day], last_seen=lasts[day], domain='',
                         title=rule['name'], reason=f"Estimated internet-active time is {seconds / 60:.1f} minutes; daily limit is {rule['minutes']} minutes.",
-                        evidence='Payload activity sessions; background exclusions applied', count=1)
+                        evidence='Payload activity sessions; background exclusions applied', count=1, source=source)
         db.execute('DELETE FROM alerts')
         for row in output.values():
-            db.execute('INSERT INTO alerts VALUES(?,?,?,?,?,?,?,?,?,?,?,?)', list(row.values()) + [old_ack.get(row['id'], 0)])
+            row['acknowledged'] = old_ack.get(row['id'], 0)
+            keys = list(row)
+            db.execute('INSERT INTO alerts(' + ','.join(keys) + ') VALUES(' + ','.join('?' for _ in keys) + ')', list(row.values()))
 
     def save_rule(self, rule, rule_id=None):
         with self.lock, self.connect() as db:
@@ -238,16 +259,26 @@ class Store:
             db.execute("UPDATE config SET value=? WHERE key='settings'", (json.dumps(settings),))
             self.rebuild_alerts(db)
 
-    def snapshot(self, day=None, device=''):
+    def snapshot(self, day=None, device='', source='all'):
+        if source not in ('all', 'live', 'import', 'demo'):
+            raise ValueError('Invalid activity source.')
         with self.connect() as db:
             settings = self.settings(db)
             tz = dt.timezone(dt.timedelta(minutes=settings['utc_offset']))
-            dates = [r[0] for r in db.execute("SELECT DISTINCT date(timestamp + ?, 'unixepoch') FROM events ORDER BY 1 DESC", (settings['utc_offset'] * 60,))]
-            day = day or (dates[0] if dates else dt.datetime.now(tz).date().isoformat())
+            scope = '' if source == 'all' else ' AND capture_id IN (SELECT id FROM captures WHERE source=?)'
+            scope_values = [] if source == 'all' else [source]
+            dates = [r[0] for r in db.execute("SELECT DISTINCT date(timestamp + ?, 'unixepoch') FROM events WHERE 1=1" + scope + ' ORDER BY 1 DESC', [settings['utc_offset'] * 60] + scope_values)]
+            today = dt.datetime.now(tz).date().isoformat()
+            day = day or (today if source == 'live' else dates[0] if dates else today)
             start, end = day_bounds(day, settings['utc_offset'])
-            devices = [dict(r) for r in db.execute('SELECT d.*,MAX(e.timestamp) last_seen,COUNT(e.id) observations FROM devices d LEFT JOIN events e ON d.ip=e.device_ip GROUP BY d.ip ORDER BY d.name')]
+            local_row = db.execute("SELECT value FROM config WHERE key='local_device'").fetchone()
+            local = json.loads(local_row[0]) if local_row else {}
+            devices = [dict(r) for r in db.execute('SELECT d.*,MAX(e.timestamp) last_seen,COUNT(e.id) observations FROM devices d LEFT JOIN events e ON d.ip=e.device_ip' + scope + ' GROUP BY d.ip HAVING COUNT(e.id)>0 OR d.ip=? ORDER BY d.name', scope_values + [local.get('id', '') if source in ('live', 'all') else ''])]
+            for item in devices:
+                item['addresses'] = [r[0] for r in db.execute('SELECT DISTINCT source_ip FROM events WHERE device_ip=?' + scope + ' ORDER BY source_ip', [item['ip']] + scope_values)]
+                item['is_local'] = item['ip'] == local.get('id')
             rows = [dict(r) for r in db.execute('SELECT * FROM events WHERE timestamp>=? AND timestamp<?' + (' AND device_ip=?' if device else '') + ' ORDER BY timestamp',
-                [start - settings['idle_seconds'], end + settings['idle_seconds']] + ([device] if device else []))]
+                [start - settings['idle_seconds'], end + settings['idle_seconds']] + ([device] if device else []))] if source == 'all' else [dict(r) for r in db.execute('SELECT * FROM events WHERE timestamp>=? AND timestamp<?' + scope + (' AND device_ip=?' if device else '') + ' ORDER BY timestamp', [start - settings['idle_seconds'], end + settings['idle_seconds']] + scope_values + ([device] if device else []))]
             day_rows = [r for r in rows if start <= r['timestamp'] < end]
             hourly, sessions, device_seconds = [0.0] * 24, [], Counter()
             grouped = defaultdict(list)
@@ -274,12 +305,13 @@ class Store:
                 domains[key]['last'] = row['timestamp']
                 domains[key]['count'] += 1
                 domains[key]['bytes'] += row['bytes']
-            alerts = [dict(r) for r in db.execute('SELECT * FROM alerts WHERE day=?' + (' AND device_ip=?' if device else '') + ' ORDER BY acknowledged,timestamp DESC', [day] + ([device] if device else []))]
-            captures = [dict(r) for r in db.execute('SELECT * FROM captures ORDER BY imported DESC LIMIT 30')]
+            source_condition = '' if source == 'all' else ' AND source=?'
+            alerts = [dict(r) for r in db.execute('SELECT * FROM alerts WHERE day=?' + source_condition + (' AND device_ip=?' if device else '') + ' ORDER BY acknowledged,timestamp DESC', [day] + scope_values + ([device] if device else []))]
+            captures = [dict(r) for r in db.execute('SELECT * FROM captures WHERE 1=1' + source_condition + ' ORDER BY imported DESC LIMIT 30', scope_values)]
             for capture in captures:
                 capture.pop('hash')
                 capture['stats'] = json.loads(capture['stats'])
-            return {'day': day, 'dates': dates, 'devices': devices, 'settings': settings,
+            return {'source': source, 'day': day, 'today': today, 'dates': dates, 'devices': devices, 'settings': settings,
                     'rules': [dict(r) for r in db.execute('SELECT * FROM rules ORDER BY id')],
                     'alerts': alerts, 'captures': captures, 'hourly': hourly, 'sessions': sorted(sessions, key=lambda s: s['start'], reverse=True),
                     'activity': sorted(domains.values(), key=lambda r: r['last'], reverse=True),

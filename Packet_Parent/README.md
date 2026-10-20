@@ -151,3 +151,19 @@ On startup, older captures explicitly marked as synthetic demo data are removed 
 ### Scale benchmark
 Run python tools/bench_scale.py for temporary 100k, 500k and 1M observation datasets (twenty packets per second, one domain rule). It measures full alert rebuild, a daily snapshot, and a 200-packet tail import. Parser time is excluded. Baseline measurements are saved in tools/benchmark-before.txt.
 
+
+### Aggregated metadata and migration
+Events are grouped by source (live/import), device, whole second, remote IP, domain,
+protocol, evidence and activity flag. Packet and byte counters preserve observation
+totals. Exact first/last timestamps preserve subsecond session endpoints; aggregating
+within one second does not bridge a gap larger than the minimum session threshold.
+A compact fingerprint ledger retains duplicate detection across overlapping/re-encoded
+captures, capture ownership, timestamps, byte counts and observed device addresses.
+It still has one entry per unique packet; event aggregation does not make disk usage
+independent of packet volume. No packet payload is stored in SQLite.
+
+Existing per-packet databases are backed up with SQLite's backup API into
+`data/backups/before-aggregation-*.sqlite3` before an atomic migration. Restarting
+an already migrated database does not repeat the migration or backup. Empty databases
+need no backup. Keep enough free disk space for the backup and migration. Backups
+contain historical metadata and must be protected like the live database.

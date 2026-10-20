@@ -9,6 +9,7 @@ from contextlib import closing
 from local_monitor import capture_context, data_directory
 from packets import parse_capture
 from service import Store, category
+from storage import ingest, remove_capture_events
 
 
 def repair(store, root, inbox=None):
@@ -44,16 +45,10 @@ def repair(store, root, inbox=None):
             db.backup(destination)
         db.execute('INSERT OR IGNORE INTO devices(ip,name) VALUES(?,?)', (context['id'], context['name']))
         db.execute('INSERT OR REPLACE INTO config VALUES(?,?)', ('local_device', json.dumps(context)))
-        before = db.execute('SELECT COUNT(*) FROM events').fetchone()[0]
+        before = db.execute('SELECT COALESCE(SUM(packets),0) FROM events').fetchone()[0]
         for capture_id, raw, rows, stats in prepared:
-            db.execute('DELETE FROM events WHERE capture_id=?', (capture_id,))
-            inserted = 0
-            for row in rows:
-                values = [hashlib.sha256(('live:' + row['fingerprint']).encode()).hexdigest(), capture_id,
-                          context['id'], row['timestamp'], row['remote_ip'], row['domain'], row['protocol'],
-                          row['evidence'], row['active'], row['bytes'], category(row['domain']), row['source_ip']]
-                inserted += db.execute('''INSERT OR IGNORE INTO events(fingerprint,capture_id,device_ip,timestamp,
-                    remote_ip,domain,protocol,evidence,active,bytes,category,source_ip) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''', values).rowcount
+            remove_capture_events(db, capture_id)
+            inserted = ingest(db, rows, capture_id, 'live', category, context['name'])
             stats.update(inserted=inserted, duplicates=len(rows)-inserted)
             db.execute("UPDATE captures SET source='live',hash=?,stats=?,first=?,last=? WHERE id=?",
                        (hashlib.sha256(b'live\0'+raw).hexdigest(), json.dumps(stats), min(r['timestamp'] for r in rows),
@@ -66,7 +61,7 @@ def repair(store, root, inbox=None):
         store.rebuild_alerts(db)
         db.execute('''DELETE FROM devices WHERE ip!=? AND ip NOT IN (SELECT device_ip FROM events)
             AND ip NOT IN (SELECT device_ip FROM rules)''', (context['id'],))
-        after = db.execute('SELECT COUNT(*) FROM events').fetchone()[0]
+        after = db.execute('SELECT COALESCE(SUM(packets),0) FROM events').fetchone()[0]
     return {'repaired_captures': len(prepared), 'removed_non_internet_observations': before-after,
             'retained_observations': after, 'backup': str(backup), 'device': context['name']}
 

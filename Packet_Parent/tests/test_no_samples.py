@@ -36,7 +36,7 @@ class LegacyCleanupTests(unittest.TestCase):
             self.assertEqual(len(backups),1)
             connection=sqlite3.connect(backups[0])
             try:
-                self.assertEqual(connection.execute('SELECT COUNT(*) FROM events').fetchone()[0],506)
+                self.assertEqual(connection.execute('SELECT SUM(packets) FROM events').fetchone()[0],506)
             finally:
                 connection.close()
             Store(path)

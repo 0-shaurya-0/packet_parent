@@ -17,7 +17,7 @@ CATEGORIES = {
     'Gaming': ['roblox.com', 'rbxcdn.com', 'steampowered.com', 'steamcontent.com', 'epicgames.com', 'minecraft.net', 'xboxlive.com'],
     'Social': ['instagram.com', 'facebook.com', 'discord.com', 'discord.gg', 'reddit.com', 'snapchat.com', 'tiktok.com', 'whatsapp.com'],
 }
-DEFAULT_SETTINGS = {'idle_seconds': 120, 'utc_offset': 330, 'ignored_domains': ['windowsupdate.com', 'update.microsoft.com', 'time.windows.com']}
+DEFAULT_SETTINGS = {'keep_raw_captures': False, 'retention_days': 90, 'idle_seconds': 120, 'utc_offset': 330, 'ignored_domains': ['windowsupdate.com', 'update.microsoft.com', 'time.windows.com']}
 
 
 def matches(domain, root):
@@ -159,9 +159,26 @@ class Store:
 
     def settings(self, db=None):
         if db is not None:
-            return json.loads(db.execute("SELECT value FROM config WHERE key='settings'").fetchone()[0])
+            return {**DEFAULT_SETTINGS, **json.loads(db.execute("SELECT value FROM config WHERE key='settings'").fetchone()[0])}
         with self.connect() as conn:
             return self.settings(conn)
+
+    def purge(self, now=None):
+        """Delete metadata older than the configured local-day retention boundary."""
+        with self.lock, self.connect() as db:
+            settings = self.settings(db)
+            days = settings['retention_days']
+            if not days:
+                return 0
+            tz = dt.timezone(dt.timedelta(minutes=settings['utc_offset']))
+            today = dt.datetime.fromtimestamp(now, tz).date() if now is not None else dt.datetime.now(tz).date()
+            cutoff_day = (today - dt.timedelta(days=days)).isoformat()
+            cutoff, _ = day_bounds(cutoff_day, settings['utc_offset'])
+            removed = db.execute('DELETE FROM events WHERE timestamp<?', (cutoff,)).rowcount
+            db.execute('DELETE FROM alerts WHERE day<?', (cutoff_day,))
+            if removed:
+                self.rebuild_alerts(db, {('live', cutoff_day), ('import', cutoff_day)})
+            return removed
 
     def auth_hash(self):
         with self.connect() as db:

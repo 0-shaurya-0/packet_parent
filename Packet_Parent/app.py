@@ -1,5 +1,6 @@
 """Local-only PacketParent prototype. Run: python app.py"""
 import asyncio
+import datetime as dt
 import hashlib
 import hmac
 import json
@@ -43,10 +44,29 @@ def password_hash(password, salt=None):
     return salt + ':' + digest
 
 
+def finish_capture(path, keep):
+    """Dispose of a successfully imported segment and its identity sidecar."""
+    destination = path.parent.parent / 'processed'
+    prefix = str(time.time_ns()) + '-' if any((destination / item.name).exists() for item in (path, path.with_suffix('.json'))) else ''
+    for item in (path, path.with_suffix('.json')):
+        if not item.exists():
+            continue
+        if keep:
+            destination.mkdir(exist_ok=True)
+            item.rename(destination / (prefix + item.name))
+        else:
+            item.unlink()
+
+
 def watcher(stop):
     seen = {}
+    last_purge = None
     watch_status['running'] = True
     while not stop.wait(2):
+        today = dt.datetime.now(dt.timezone.utc).date()
+        if today != last_purge:
+            store.purge()
+            last_purge = today
         if not store.auth_hash():
             continue
         for path in sorted(INBOX.glob('*.pcap*')):
@@ -70,7 +90,8 @@ def watcher(stop):
                     if saved.get('id') == context['id']:
                         context = saved
                 result = store.import_capture(path.read_bytes(), path.name, monitored=context)
-                seen[str(path)] = (signature, True)
+                finish_capture(path, store.settings()['keep_raw_captures'])
+                seen.pop(str(path), None)
                 if not result['duplicate']:
                     watch_status['last_import'] = time.time()
                 watch_status['error'] = None
@@ -81,6 +102,7 @@ def watcher(stop):
 
 @asynccontextmanager
 async def lifespan(app):
+    await run_in_threadpool(store.purge)
     stop = threading.Event()
     worker = threading.Thread(target=watcher, args=(stop,), daemon=True)
     worker.start()
@@ -357,10 +379,16 @@ async def settings(request: Request):
     ignored = data.get('ignored_domains', [])
     if not isinstance(ignored, list) or len(ignored) > 100 or any(not isinstance(x, str) or not clean_domain(x) for x in ignored):
         raise HTTPException(400, 'Enter up to 100 valid background domains.')
-    values = {'idle_seconds': integer(data, 'idle_seconds', 30, 600, 120),
+    keep = data.get('keep_raw_captures', store.settings()['keep_raw_captures'])
+    if type(keep) is not bool:
+        raise HTTPException(400, 'keep_raw_captures must be true or false.')
+    values = {'keep_raw_captures': keep,
+              'retention_days': integer(data, 'retention_days', 0, 36500, store.settings()['retention_days']),
+              'idle_seconds': integer(data, 'idle_seconds', 30, 600, 120),
               'utc_offset': integer(data, 'utc_offset', -720, 840, 330),
               'ignored_domains': [clean_domain(x) for x in ignored]}
     await run_in_threadpool(store.save_settings, values)
+    await run_in_threadpool(store.purge)
     return {'ok': True}
 
 

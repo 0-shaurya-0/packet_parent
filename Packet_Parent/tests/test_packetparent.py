@@ -289,12 +289,25 @@ class ApiTests(unittest.TestCase):
         self.client.post('/api/alerts/'+alert['id']+'/acknowledge',headers=self.headers)
         self.assertTrue(next(a for a in self.client.get('/api/dashboard?source=import&day=2026-10-14').json()['alerts'] if a['id']==alert['id'])['acknowledged'])
 
+    def test_privacy_settings_validation(self):
+        """Privacy settings accept only bounded integers and real booleans."""
+        self.setup_parent()
+        for value in (-1, 36501, True, '90'):
+            self.assertEqual(self.client.put('/api/settings', json={'retention_days': value}, headers=self.headers).status_code, 400)
+        self.assertEqual(self.client.put('/api/settings', json={'keep_raw_captures': 'false'}, headers=self.headers).status_code, 400)
+        response = self.client.put('/api/settings', json={'keep_raw_captures': True, 'retention_days': 0}, headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        values = self.client.get('/api/dashboard').json()['settings']
+        self.assertTrue(values['keep_raw_captures'])
+        self.assertEqual(values['retention_days'], 0)
+
     def test_completed_inbox_file_is_imported(self):
         self.setup_parent()
         original=self.module.INBOX
         inbox=Path(self.temp.name)/'inbox';inbox.mkdir()
         self.module.INBOX=inbox
-        (inbox/'finished.pcap').write_bytes(make_traffic(day=DAY))
+        (inbox/'finished.pcap').write_bytes(make_traffic())
+        (inbox/'finished.json').write_text('{}')
         stop=threading.Event()
         worker=threading.Thread(target=self.module.watcher,args=(stop,))
         mock_context = patch.object(self.module, 'capture_context', return_value={'id':'pc-test','name':'Test PC','ips':['192.168.1.20','192.168.1.21'],'macs':[]})
@@ -303,11 +316,13 @@ class ApiTests(unittest.TestCase):
         try:
             deadline=time.monotonic()+8
             while time.monotonic()<deadline:
-                if self.module.store.snapshot()['summary']['observations']==505:
+                if self.module.store.snapshot()['summary']['observations']==505 and not (inbox/'finished.pcap').exists():
                     break
                 time.sleep(.1)
             self.assertEqual(self.module.store.snapshot()['summary']['observations'],505)
             self.assertIsNone(self.module.watch_status['error'])
+            self.assertFalse((inbox/'finished.pcap').exists())
+            self.assertFalse((inbox/'finished.json').exists())
         finally:
             stop.set();worker.join(timeout=3);self.module.INBOX=original;mock_context.stop()
 

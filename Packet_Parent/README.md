@@ -72,7 +72,7 @@ python capture.py --list
 python capture.py --interface 1
 ```
 
-Replace `1` with the desired interface from the list. Keep the dashboard server running too. The helper captures ten-second segments, then moves completed files into `data/inbox`. The server watches that folder and automatically imports completed captures. Capture files remain there until you remove them. The helper uses a 2,048-byte snapshot limit, a local MAC capture filter, and non-promiscuous mode. Segments are bounded by duration, file size, and packet count. Large or split handshakes may still be truncated. Stopping discards the unfinished segment; completed history is retained.
+Replace `1` with the desired interface from the list. Keep the dashboard server running too. The helper captures ten-second segments, then moves completed files into `data/inbox`. The server watches that folder and automatically imports completed captures. Successfully imported segments and their JSON identity sidecars are deleted by default. Enable Keep raw captures in Settings to move them to `data/processed/` instead. The helper uses a configurable snapshot limit (default 2,048 bytes), a local MAC capture filter, and non-promiscuous mode. Segments are bounded by duration, file size, and packet count. Large or split handshakes may still be truncated. Stopping discards the unfinished segment; completed history is retained.
 
 The dashboard distinguishes the inbox watcher from a running capture sensor. Short capture gaps can occur while the helper restarts TShark between segments. The local Windows WiFi → TShark → inbox → SQLite → dashboard flow was verified with a real capture. The helper reads the running dashboard’s data directory, and refuses an explicitly conflicting PACKETPARENT_DATA setting. Each data directory permits one sensor process at a time.
 
@@ -100,7 +100,7 @@ Completed inbox file ─┘─> packets.py ─> service.py ─> SQLite
 | `static/` | Responsive dashboard and API client |
 | `tests/test_packetparent.py` | Parser, estimator, persistence, and API tests |
 
-SQLite tables: `config`, `devices`, `captures`, `events`, `rules`, and `alerts`. WAL mode is enabled, and application writes are serialized. Uploaded raw captures are parsed in memory; the application stores metadata rather than raw payloads. Files produced by the optional capture helper are retained in the inbox.
+SQLite tables: `config`, `devices`, `captures`, `events`, `rules`, and `alerts`. WAL mode is enabled, and application writes are serialized. Uploaded raw captures are parsed in memory; the application stores metadata rather than raw payloads. Files produced by the helper leave the inbox after successful ingestion; by default they are deleted.
 
 By default the database is `data/packetparent.sqlite3`. The `PACKETPARENT_DATA` environment variable can redirect runtime data, including the inbox, to a separate directory. Do not share runtime data or a configured database as part of the source package.
 
@@ -125,7 +125,7 @@ Stop monitoring and the server, then run `python repair_history.py` from the pro
 - Day boundaries and rule schedules use a fixed UTC offset, initialized from the browser. Daylight saving adjustments are manual.
 - Capture timestamps establish when activity was observed; the system does not claim complete monitoring coverage or infer that missing data means offline time.
 - One local parent account; no cloud synchronization, multiple household accounts, or remote access configuration.
-- There is no automatic metadata retention policy or password-recovery workflow in this prototype. Keep the source package separate from `data`.
+- There is no password-recovery workflow in this prototype. Keep the source package separate from `data`.
 
 ## Tests
 
@@ -174,3 +174,28 @@ those days and their boundary context. More traffic on the same day can still in
 that day's evaluation cost; unrelated older history does not require re-evaluation.
 Rule and settings changes deliberately rebuild all alerts. Stable alert IDs preserve
 reviewed flags whenever the corresponding alert still exists.
+
+### Privacy settings and retention
+
+Settings exposes `keep_raw_captures` (boolean, default false) and `retention_days`
+(integer 0-36500, default 90; zero keeps metadata forever). PUT `/api/settings`
+validates both. Saving settings applies retention immediately. At server startup
+and once per UTC calendar day while running, events before local midnight N days
+ago and their alerts are removed, including their fingerprint/address entries.
+The first retained day is reevaluated so an expired session cannot extend its time.
+Capture import receipts/hashes remain for duplicate-file detection; device names,
+rules and settings remain. Deleted observations are no longer deduplicated against
+a differently encoded old capture, so importing one again can restore old history
+until the next purge. Same-file reimports remain duplicate receipts.
+
+Backups and files deliberately kept in `data/processed/` are not automatically
+purged; remove them manually when no longer needed. SQLite deletion is logical,
+not guaranteed forensic erasure; unused pages, WAL, filesystem copies and backups
+may retain old bytes. Raw uploads are parsed in memory. Interrupted helper segments
+are deleted when the helper exits normally; a crash may leave a `.partial` file
+in the data folder, which needs manual removal.
+
+Use `python capture.py --interface 1 --snaplen 1024`, or set
+`PACKETPARENT_SNAPLEN=1024` before starting the dashboard/helper. Valid values are
+64-262144 bytes; the default remains 2048. Smaller values reduce captured payload
+but can truncate TLS ClientHellos and hide server names. This does not decrypt TLS.

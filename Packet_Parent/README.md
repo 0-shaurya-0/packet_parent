@@ -199,3 +199,12 @@ Use `python capture.py --interface 1 --snaplen 1024`, or set
 `PACKETPARENT_SNAPLEN=1024` before starting the dashboard/helper. Valid values are
 64-262144 bytes; the default remains 2048. Smaller values reduce captured payload
 but can truncate TLS ClientHellos and hide server names. This does not decrypt TLS.
+
+### Failed imports
+The watcher waits for a file to be unchanged across two polls. Failed inputs and
+sidecars move to `data/failed/`, alongside a small `.error.txt`; they are not retried.
+Later files continue processing. The dashboard shows the latest failure until the
+next successful import. Quarantined raw data can contain payload and is kept for
+manual diagnosis/removal, outside metadata retention. If filesystem permissions
+prevent quarantine, the error includes that failure and the unchanged input is
+suppressed for the current server run. Fix permissions before restarting.

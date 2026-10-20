@@ -58,46 +58,82 @@ def finish_capture(path, keep):
             item.unlink()
 
 
+def quarantine_capture(path, error):
+    """Move failed input and its sidecar out of the inbox without overwriting files."""
+    folder = path.parent.parent / 'failed'
+    folder.mkdir(exist_ok=True)
+    prefix = str(time.time_ns()) + '-'
+    destination = folder / (prefix + path.name)
+    path.rename(destination)
+    sidecar = path.with_suffix('.json')
+    if sidecar.exists():
+        sidecar.rename(folder / (prefix + sidecar.name))
+    destination.with_suffix(destination.suffix + '.error.txt').write_text(error[:1000], encoding='utf-8')
+
+
+def poll_inbox(seen):
+    """Import stable files once, disposing successes and quarantining failures."""
+    paths = sorted(path for path in INBOX.glob('*.pcap*') if path.suffix.lower() in ('.pcap', '.pcapng'))
+    present = {str(path) for path in paths}
+    for missing in set(seen) - present:
+        seen.pop(missing, None)
+    for path in paths:
+        try:
+            stat = path.stat()
+            signature = (stat.st_size, stat.st_mtime_ns)
+            previous = seen.get(str(path))
+            if previous and previous[0] == signature and previous[1]:
+                continue
+            if not previous or previous[0] != signature:
+                seen[str(path)] = (signature, False)
+                continue
+            if stat.st_size > MAX_UPLOAD:
+                raise ValueError('Capture exceeds 25 MB.')
+            context = capture_context(DATA)
+            sidecar = path.with_suffix('.json')
+            if sidecar.exists():
+                saved = json.loads(sidecar.read_text(encoding='utf-8'))
+                if saved.get('id') == context['id']:
+                    context = saved
+            result = store.import_capture(path.read_bytes(), path.name, monitored=context)
+            finish_capture(path, store.settings()['keep_raw_captures'])
+            seen.pop(str(path), None)
+            if not result['duplicate']:
+                watch_status['last_import'] = time.time()
+            watch_status['error'] = None
+        except FileNotFoundError:
+            # A producer/user may remove a file between listing and opening it.
+            seen.pop(str(path), None)
+        except Exception as exc:
+            error = f'{path.name}: {str(exc)[:240]}'
+            watch_status['error'] = error
+            if str(path) in seen:
+                seen[str(path)] = (seen[str(path)][0], True)
+            try:
+                quarantine_capture(path, error)
+                seen.pop(str(path), None)
+            except OSError as move_error:
+                watch_status['error'] = error + '; could not quarantine: ' + str(move_error)[:160]
+
+
 def watcher(stop):
+    """Poll until shutdown, with one retention pass per UTC day."""
     seen = {}
     last_purge = None
     watch_status['running'] = True
-    while not stop.wait(2):
-        today = dt.datetime.now(dt.timezone.utc).date()
-        if today != last_purge:
-            store.purge()
-            last_purge = today
-        if not store.auth_hash():
-            continue
-        for path in sorted(INBOX.glob('*.pcap*')):
-            if path.suffix.lower() not in ('.pcap', '.pcapng'):
-                continue
-            try:
-                stat = path.stat()
-                signature = (stat.st_size, stat.st_mtime_ns)
-                previous = seen.get(str(path))
-                if previous and previous[0] == signature and previous[1]:
-                    continue
-                if not previous or previous[0] != signature:
-                    seen[str(path)] = (signature, False)
-                    continue
-                if stat.st_size > MAX_UPLOAD:
-                    raise ValueError('Capture exceeds 25 MB.')
-                context = capture_context(DATA)
-                sidecar = path.with_suffix('.json')
-                if sidecar.exists():
-                    saved = json.loads(sidecar.read_text(encoding='utf-8'))
-                    if saved.get('id') == context['id']:
-                        context = saved
-                result = store.import_capture(path.read_bytes(), path.name, monitored=context)
-                finish_capture(path, store.settings()['keep_raw_captures'])
-                seen.pop(str(path), None)
-                if not result['duplicate']:
-                    watch_status['last_import'] = time.time()
-                watch_status['error'] = None
-            except Exception as exc:
-                watch_status['error'] = f'{path.name}: {str(exc)[:240]}'
-    watch_status['running'] = False
+    try:
+        while not stop.wait(2):
+            today = dt.datetime.now(dt.timezone.utc).date()
+            if today != last_purge:
+                last_purge = today
+                try:
+                    store.purge()
+                except Exception as exc:
+                    watch_status['error'] = 'Retention failed: ' + str(exc)[:240]
+            if store.auth_hash():
+                poll_inbox(seen)
+    finally:
+        watch_status['running'] = False
 
 
 @asynccontextmanager

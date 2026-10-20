@@ -54,3 +54,40 @@ class PrivacyTests(unittest.TestCase):
                 self.assertEqual(db.execute('SELECT COUNT(*) FROM event_addresses').fetchone()[0], 1)
                 self.assertEqual(db.execute('PRAGMA foreign_key_check').fetchall(), [])
             self.assertTrue(store.import_capture(raw, 'same.pcap')['duplicate'])
+
+class WatcherTests(unittest.TestCase):
+    def test_corrupt_file_quarantined_once_and_other_files_continue(self):
+        """A corrupt segment cannot block later imports or loop on every poll."""
+        import app
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inbox = root / 'inbox'
+            inbox.mkdir()
+            store = Store(root / 'db.sqlite3')
+            context = dict(id='pc-test', name='Test PC', ips=['192.168.1.3'], macs=[])
+            status = dict(running=True, last_import=None, error=None)
+            bad = inbox / 'a-bad.pcap'
+            bad.write_bytes(b'broken')
+            bad.with_suffix('.json').write_text('{}')
+            seen = {}
+            with patch.object(app, 'store', store), patch.object(app, 'INBOX', inbox), patch.object(app, 'watch_status', status), patch.object(app, 'capture_context', return_value=context), patch.object(store, 'import_capture', wraps=store.import_capture) as importer:
+                app.poll_inbox(seen)
+                app.poll_inbox(seen)
+                self.assertEqual(importer.call_count, 1)
+                self.assertIn('a-bad.pcap', status['error'])
+                self.assertFalse(bad.exists())
+                self.assertEqual(len(list((root / 'failed').glob('*.pcap'))), 1)
+                self.assertEqual(len(list((root / 'failed').glob('*.json'))), 1)
+                self.assertTrue(next((root / 'failed').glob('*.error.txt')).read_text())
+                app.poll_inbox(seen)
+                self.assertEqual(importer.call_count, 1)
+                frame = packet('192.168.1.3', '8.8.4.4', 50000, 443, b'hello')
+                (inbox / 'b-good.pcap').write_bytes(pcap([(dt.datetime.now().timestamp(), frame)]))
+                app.poll_inbox(seen)
+                app.poll_inbox(seen)
+                self.assertEqual(importer.call_count, 2)
+                self.assertIsNone(status['error'])
+                self.assertIsNotNone(status['last_import'])
+                self.assertEqual(store.snapshot()['summary']['observations'], 1)
+                self.assertEqual(list(inbox.iterdir()), [])
+                self.assertEqual(seen, {})

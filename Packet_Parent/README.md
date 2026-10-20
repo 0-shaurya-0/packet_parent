@@ -167,3 +167,10 @@ Existing per-packet databases are backed up with SQLite's backup API into
 an already migrated database does not repeat the migration or backup. Empty databases
 need no backup. Keep enough free disk space for the backup and migration. Backups
 contain historical metadata and must be protected like the live database.
+
+Imports recompute alerts only for the affected source/local days, including adjacent
+midnight days within the session threshold. Indexed source/time queries read only
+those days and their boundary context. More traffic on the same day can still increase
+that day's evaluation cost; unrelated older history does not require re-evaluation.
+Rule and settings changes deliberately rebuild all alerts. Stable alert IDs preserve
+reviewed flags whenever the corresponding alert still exists.

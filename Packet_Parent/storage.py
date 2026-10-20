@@ -25,6 +25,7 @@ def migrate(store):
     """Back up populated legacy databases, then atomically fold packet rows."""
     with store.lock, store.connect() as db:
         if 'packets' in {row[1] for row in db.execute('PRAGMA table_info(events)')}:
+            ensure_addresses(db)
             return
         if db.execute('SELECT 1 FROM events LIMIT 1').fetchone():
             folder = Path(store.path).parent / 'backups'
@@ -69,12 +70,23 @@ def migrate(store):
         db.execute('CREATE INDEX event_source_time ON events(source,timestamp)')
         db.execute('CREATE INDEX fingerprint_event ON fingerprints(event_id)')
         db.execute('CREATE INDEX fingerprint_capture ON fingerprints(capture_id)')
+        ensure_addresses(db)
+
+
+def ensure_addresses(db):
+    """Keep address lookups proportional to aggregates, not packet fingerprints."""
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name='event_addresses'").fetchone():
+        return
+    db.execute("""CREATE TABLE event_addresses(event_id INTEGER REFERENCES events(id) ON DELETE CASCADE,
+                   source_ip TEXT NOT NULL, PRIMARY KEY(event_id,source_ip)) WITHOUT ROWID""")
+    db.execute('INSERT INTO event_addresses SELECT DISTINCT event_id,source_ip FROM fingerprints')
 
 
 def ingest(db, rows, capture_id, source, categorize, name=None):
     """Count unseen fingerprints and upsert their exact second-level aggregates."""
     inserted = 0
     devices = set()
+    addresses = set()
     for row in rows:
         fingerprint = hashlib.sha256((source + ':' + row['fingerprint']).encode()).digest()
         if db.execute('SELECT 1 FROM fingerprints WHERE fingerprint=?', (fingerprint,)).fetchone():
@@ -95,7 +107,9 @@ def ingest(db, rows, capture_id, source, categorize, name=None):
                                     row['source_ip'], row['timestamp'], row['timestamp'])).fetchone()[0]
         db.execute('INSERT INTO fingerprints VALUES(?,?,?,?,?,?)',
                    (fingerprint, event_id, capture_id, row['timestamp'], row['bytes'], row['source_ip']))
+        addresses.add((event_id, row['source_ip']))
         inserted += 1
+    db.executemany('INSERT OR IGNORE INTO event_addresses VALUES(?,?)', addresses)
     return inserted
 
 
@@ -104,6 +118,8 @@ def remove_capture_events(db, capture_id):
     ids = [row[0] for row in db.execute('SELECT DISTINCT event_id FROM fingerprints WHERE capture_id=?', (capture_id,))]
     db.execute('DELETE FROM fingerprints WHERE capture_id=?', (capture_id,))
     for event_id in ids:
+        db.execute('DELETE FROM event_addresses WHERE event_id=?', (event_id,))
+        db.execute('INSERT INTO event_addresses SELECT DISTINCT event_id,source_ip FROM fingerprints WHERE event_id=?', (event_id,))
         row = db.execute('''SELECT COUNT(*),SUM(bytes),MIN(timestamp),MAX(timestamp),MIN(capture_id)
                             FROM fingerprints WHERE event_id=?''', (event_id,)).fetchone()
         if not row[0]:

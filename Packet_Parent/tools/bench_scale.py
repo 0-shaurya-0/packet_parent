@@ -21,14 +21,15 @@ def observations(count, start, offset=0):
                    evidence='TLS server name', active=1, bytes=1000)
 
 
-def benchmark(count):
+def benchmark(count, spread=False):
     """Measure identical imports and dashboard work before and after aggregation."""
     with tempfile.TemporaryDirectory() as directory:
         store = Store(Path(directory) / 'bench.sqlite3')
         start = day_bounds('2026-10-14', 330)[0]
         # Seed in bounded batches, without including parser cost in this storage benchmark.
         for offset in range(0, count, 100000):
-            rows = list(observations(min(100000, count-offset), start, offset))
+            seed_start = start - ((count - offset - 1) // 100000) * 86400 - (offset // 20 if spread else 0) if spread else start
+            rows = list(observations(min(100000, count-offset), seed_start, offset))
             with patch('service.parse_capture', return_value=(rows, {'observations': len(rows)})):
                 store.import_capture(str(offset).encode(), 'synthetic.pcap')
         with store.connect() as db:
@@ -40,19 +41,22 @@ def benchmark(count):
         then = time.perf_counter()
         snapshot = store.snapshot('2026-10-14')
         snapshot_time = time.perf_counter() - then
-        rows = list(observations(200, start, count))
+        tail_start = start - (count - 100000) // 20 if spread else start
+        rows = list(observations(200, tail_start, count))
         then = time.perf_counter()
         with patch('service.parse_capture', return_value=(rows, {'observations': len(rows)})):
             store.import_capture(b'tail', 'tail.pcap')
         tail = time.perf_counter() - then
         with store.connect() as db:
             stored = db.execute('SELECT COUNT(*) FROM events').fetchone()[0]
-        assert snapshot['summary']['observations'] == count
-        print(f'raw={count:,} rows_after_tail={stored:,} rebuild={rebuild:.3f}s snapshot={snapshot_time:.3f}s tail_import={tail:.3f}s', flush=True)
+        assert snapshot['summary']['observations'] == (min(count, 100000) if spread else count)
+        print(f'spread={spread} raw={count:,} rows_after_tail={stored:,} rebuild={rebuild:.3f}s snapshot={snapshot_time:.3f}s tail_import={tail:.3f}s', flush=True)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--counts', nargs='+', type=int, default=[100000, 500000, 1000000])
-    for size in parser.parse_args().counts:
-        benchmark(size)
+    parser.add_argument('--spread', action='store_true', help='Keep current-day traffic fixed; add older days')
+    args = parser.parse_args()
+    for size in args.counts:
+        benchmark(size, args.spread)

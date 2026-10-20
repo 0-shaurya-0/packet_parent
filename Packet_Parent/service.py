@@ -97,6 +97,7 @@ class Store:
                 db.execute('UPDATE events SET source_ip=device_ip')
             if 'source' not in {r[1] for r in db.execute('PRAGMA table_info(alerts)')}:
                 db.execute("ALTER TABLE alerts ADD COLUMN source TEXT NOT NULL DEFAULT 'import'")
+            db.execute('CREATE INDEX IF NOT EXISTS alert_source_day ON alerts(source,day)')
         self.remove_legacy_samples()
         migrate(self)
 
@@ -199,19 +200,47 @@ class Store:
                 stats['inserted'] = inserted
                 stats['duplicates'] = len(rows) - inserted
                 db.execute('UPDATE captures SET stats=? WHERE id=?', (json.dumps(stats), capture_id))
-                self.rebuild_alerts(db)
+                if inserted:
+                    settings = self.settings(db)
+                    tz = dt.timezone(dt.timedelta(minutes=settings['utc_offset']))
+                    touched = set()
+                    for row in rows:
+                        for timestamp in (row['timestamp'] - settings['idle_seconds'],
+                                          row['timestamp'], row['timestamp'] + settings['idle_seconds']):
+                            touched.add((source, dt.datetime.fromtimestamp(timestamp, tz).date().isoformat()))
+                    self.rebuild_alerts(db, touched)
             return {'duplicate': False, 'id': capture_id, 'stats': stats, 'message': f'Imported {inserted:,} observations.'}
 
-    def rebuild_alerts(self, db):
+    def rebuild_alerts(self, db, pairs=None):
+        """Rebuild all alerts, or only affected source/day partitions with boundary context."""
+        if pairs is None:
+            self._evaluate_alerts(db)
+        else:
+            for source, day in sorted(pairs):
+                self._evaluate_alerts(db, source, day)
+
+    def _evaluate_alerts(self, db, source=None, day=None):
+        """Evaluate one day using adjacent activity to preserve midnight sessions."""
+        condition = '' if source is None else ' WHERE source=? AND day=?'
+        parameters = [] if source is None else [source, day]
         if not db.execute('SELECT 1 FROM rules WHERE enabled=1').fetchone():
-            db.execute('DELETE FROM alerts')
+            db.execute('DELETE FROM alerts' + condition, parameters)
             return
         settings = self.settings(db)
         tz = dt.timezone(dt.timedelta(minutes=settings['utc_offset']))
-        order = 'first_ts' if 'packets' in {r[1] for r in db.execute('PRAGMA table_info(events)')} else 'timestamp'
-        rows = [dict(r) for r in db.execute('SELECT e.*,c.source FROM events e JOIN captures c ON c.id=e.capture_id ORDER BY ' + order)]
+        aggregated = 'packets' in {r[1] for r in db.execute('PRAGMA table_info(events)')}
+        order = 'first_ts' if aggregated else 'timestamp'
+        query = 'SELECT e.*,c.source FROM events e JOIN captures c ON c.id=e.capture_id'
+        values = []
+        if source is not None:
+            start, end = day_bounds(day, settings['utc_offset'])
+            source_column = 'e.source' if aggregated else 'c.source'
+            query += ' WHERE ' + source_column + '=? AND e.timestamp>=? AND e.timestamp<?'
+            values = [source, start - settings['idle_seconds'], end + settings['idle_seconds']]
+        rows = [dict(r) for r in db.execute(query + ' ORDER BY ' + order, values)]
+        requested_day = day
         rules = [dict(r) for r in db.execute('SELECT * FROM rules WHERE enabled=1')]
-        old_ack = {r['id']: r['acknowledged'] for r in db.execute('SELECT id,acknowledged FROM alerts')}
+        old_ack = {r['id']: r['acknowledged'] for r in db.execute('SELECT id,acknowledged FROM alerts' + condition, parameters)}
         output, times = {}, defaultdict(list)
         for row in rows:
             local = dt.datetime.fromtimestamp(row['timestamp'], tz)
@@ -260,8 +289,10 @@ class Store:
                     output[key] = dict(id=key, rule_id=rule['id'], device_ip=ip, day=day, timestamp=lasts[day], last_seen=lasts[day], domain='',
                         title=rule['name'], reason=f"Estimated internet-active time is {seconds / 60:.1f} minutes; daily limit is {rule['minutes']} minutes.",
                         evidence='Payload activity sessions; background exclusions applied', count=1, source=source)
-        db.execute('DELETE FROM alerts')
+        db.execute('DELETE FROM alerts' + condition, parameters)
         for row in output.values():
+            if requested_day is not None and row['day'] != requested_day:
+                continue
             row['acknowledged'] = old_ack.get(row['id'], 0)
             keys = list(row)
             db.execute('INSERT INTO alerts(' + ','.join(keys) + ') VALUES(' + ','.join('?' for _ in keys) + ')', list(row.values()))
@@ -305,7 +336,7 @@ class Store:
             local = json.loads(local_row[0]) if local_row else {}
             devices = [dict(r) for r in db.execute('SELECT d.*,MAX(e.last_ts) last_seen,COALESCE(SUM(e.packets),0) observations FROM devices d LEFT JOIN events e ON d.ip=e.device_ip' + scope + ' GROUP BY d.ip HAVING COUNT(e.id)>0 OR d.ip=? ORDER BY d.name', scope_values + [local.get('id', '') if source in ('live', 'all') else ''])]
             for item in devices:
-                item['addresses'] = [r[0] for r in db.execute('SELECT DISTINCT source_ip FROM fingerprints WHERE event_id IN (SELECT id FROM events WHERE device_ip=?' + scope + ') ORDER BY source_ip', [item['ip']] + scope_values)]
+                item['addresses'] = [r[0] for r in db.execute('SELECT DISTINCT source_ip FROM event_addresses WHERE event_id IN (SELECT id FROM events WHERE device_ip=?' + scope + ') ORDER BY source_ip', [item['ip']] + scope_values)]
                 item['is_local'] = item['ip'] == local.get('id')
             rows = [dict(r) for r in db.execute('SELECT * FROM events WHERE timestamp>=? AND timestamp<?' + (' AND device_ip=?' if device else '') + ' ORDER BY timestamp',
                 [start - settings['idle_seconds'], end + settings['idle_seconds']] + ([device] if device else []))] if source == 'all' else [dict(r) for r in db.execute('SELECT * FROM events WHERE timestamp>=? AND timestamp<?' + scope + (' AND device_ip=?' if device else '') + ' ORDER BY timestamp', [start - settings['idle_seconds'], end + settings['idle_seconds']] + scope_values + ([device] if device else []))]

@@ -208,3 +208,10 @@ next successful import. Quarantined raw data can contain payload and is kept for
 manual diagnosis/removal, outside metadata retention. If filesystem permissions
 prevent quarantine, the error includes that failure and the unchanged input is
 suppressed for the current server run. Fix permissions before restarting.
+
+IPv6 parsing recognizes Fragment and Authentication headers. Non-first fragments
+are skipped; there is still no fragment reassembly. UDP/443 connections without a
+visible/inferred domain are labeled `QUIC (encrypted)` in activity and alerts. This
+is a port-based indication, not verified QUIC identification. DNS-to-IP inference
+retains its explicit inference label when available. QUIC and encrypted DNS reduce
+domain visibility; no QUIC decryption is implemented.

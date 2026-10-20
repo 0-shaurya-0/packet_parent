@@ -58,3 +58,19 @@ def make_traffic(offset=330, day=None):
         output.extend(struct.pack('<IIII', seconds, int((timestamp - seconds) * 1e6), len(frame), len(frame)))
         output.extend(frame)
     return bytes(output)
+
+
+def ipv6_udp(extension=0, nonfirst=False):
+    """Build a raw IPv6 UDP frame with optional Fragment or Authentication header."""
+    udp = struct.pack('!HHHH', 50000, 443, 13, 0) + b'hello'
+    if extension == 44:
+        header = struct.pack('!BBHI', 17, 0, 8 if nonfirst else 1, 123)
+    elif extension == 51:
+        # Payload Len=1 means a 12-byte AH, not the generic extension length.
+        header = struct.pack('!BBHII', 17, 1, 0, 123, 1)
+    else:
+        header = b''
+    body = header + udp
+    return (struct.pack('!IHBB', 6 << 28, len(body), extension or 17, 64)
+            + ipaddress.ip_address('fd00::3').packed
+            + ipaddress.ip_address('2001:4860:4860::8888').packed + body)

@@ -147,3 +147,7 @@ Live regression tests additionally cover multicast exclusion, IP changes, other-
 ## Existing sample records
 
 On startup, older captures explicitly marked as synthetic demo data are removed from the active database after a SQLite backup is saved in `data/backups`. Their observations, alerts, and unused device entries are removed too. The original three untouched sample rules are removed when their complete original set is identifiable. Custom or edited rules are preserved. Real captures, passwords, settings, and device names you entered are preserved. A real device that shared a sample IP keeps its observations; its unchanged sample label is reset. Automated packet fixtures live only under `tests/` and cannot populate the dashboard.
+
+### Scale benchmark
+Run python tools/bench_scale.py for temporary 100k, 500k and 1M observation datasets (twenty packets per second, one domain rule). It measures full alert rebuild, a daily snapshot, and a 200-packet tail import. Parser time is excluded. Baseline measurements are saved in tools/benchmark-before.txt.
+

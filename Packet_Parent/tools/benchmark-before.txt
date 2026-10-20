@@ -1,0 +1,3 @@
+raw=100,000 rows_after_tail=100,200 rebuild=0.724s snapshot=0.609s tail_import=0.721s
+raw=500,000 rows_after_tail=500,200 rebuild=4.373s snapshot=3.854s tail_import=4.476s
+raw=1,000,000 rows_after_tail=1,000,200 rebuild=8.405s snapshot=5.970s tail_import=6.750s

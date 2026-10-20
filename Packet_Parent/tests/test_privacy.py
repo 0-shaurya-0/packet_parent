@@ -70,7 +70,7 @@ class WatcherTests(unittest.TestCase):
             bad.write_bytes(b'broken')
             bad.with_suffix('.json').write_text('{}')
             seen = {}
-            with patch.object(app, 'store', store), patch.object(app, 'INBOX', inbox), patch.object(app, 'watch_status', status), patch.object(app, 'capture_context', return_value=context), patch.object(store, 'import_capture', wraps=store.import_capture) as importer:
+            with patch.object(app.app.state.runtime, 'store', store), patch.object(app.app.state.runtime, 'inbox', inbox), patch.object(app.app.state.runtime, 'watch_status', status), patch.object(app, 'capture_context', return_value=context), patch.object(store, 'import_capture', wraps=store.import_capture) as importer:
                 app.poll_inbox(seen)
                 app.poll_inbox(seen)
                 self.assertEqual(importer.call_count, 1)

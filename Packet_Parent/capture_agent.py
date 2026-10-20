@@ -7,13 +7,14 @@ import subprocess
 import time
 import urllib.request
 
-from local_monitor import capture_context, data_directory, interfaces, tshark_path, write_status
+from local_monitor import capture_context, data_directory, interfaces, tshark_path, write_status, server_port
 
 
 def resolve_root():
     root = data_directory()
+    port = server_port()
     try:
-        with urllib.request.urlopen('http://127.0.0.1:8765/api/health', timeout=2) as response:
+        with urllib.request.urlopen(f'http://127.0.0.1:{port}/api/health', timeout=2) as response:
             health = json.load(response)
         if health.get('application') == 'PacketParent' and health.get('data_dir'):
             active = Path(health['data_dir']).resolve()

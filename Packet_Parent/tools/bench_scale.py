@@ -28,7 +28,10 @@ def benchmark(count, spread=False):
         start = day_bounds('2026-10-14', 330)[0]
         # Seed in bounded batches, without including parser cost in this storage benchmark.
         for offset in range(0, count, 100000):
-            seed_start = start - ((count - offset - 1) // 100000) * 86400 - (offset // 20 if spread else 0) if spread else start
+            seed_start = start
+            if spread:
+                older_days = (count - offset - 1) // 100000
+                seed_start -= older_days * 86400 + offset // 20
             rows = list(observations(min(100000, count-offset), seed_start, offset))
             with patch('service.parse_capture', return_value=(rows, {'observations': len(rows)})):
                 store.import_capture(str(offset).encode(), 'synthetic.pcap')

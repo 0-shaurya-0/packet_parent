@@ -228,8 +228,8 @@ class ApiTests(unittest.TestCase):
 
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory()
-        self.module.store=Store(Path(self.temp.name)/'api.sqlite3')
-        self.module.sessions.clear();self.module.attempts.clear()
+        self.module.app.state.runtime.store=Store(Path(self.temp.name)/'api.sqlite3')
+        self.module.app.state.runtime.sessions.clear();self.module.app.state.runtime.attempts.clear()
         self.client=self.TestClient(self.module.app)
         self.headers={'X-PacketParent':'1'}
 
@@ -303,9 +303,9 @@ class ApiTests(unittest.TestCase):
 
     def test_completed_inbox_file_is_imported(self):
         self.setup_parent()
-        original=self.module.INBOX
+        original=self.module.app.state.runtime.inbox
         inbox=Path(self.temp.name)/'inbox';inbox.mkdir()
-        self.module.INBOX=inbox
+        self.module.app.state.runtime.inbox=inbox
         (inbox/'finished.pcap').write_bytes(make_traffic())
         (inbox/'finished.json').write_text('{}')
         stop=threading.Event()
@@ -316,15 +316,15 @@ class ApiTests(unittest.TestCase):
         try:
             deadline=time.monotonic()+8
             while time.monotonic()<deadline:
-                if self.module.store.snapshot()['summary']['observations']==505 and not (inbox/'finished.pcap').exists():
+                if self.module.app.state.runtime.store.snapshot()['summary']['observations']==505 and not (inbox/'finished.pcap').exists():
                     break
                 time.sleep(.1)
-            self.assertEqual(self.module.store.snapshot()['summary']['observations'],505)
-            self.assertIsNone(self.module.watch_status['error'])
+            self.assertEqual(self.module.app.state.runtime.store.snapshot()['summary']['observations'],505)
+            self.assertIsNone(self.module.app.state.runtime.watch_status['error'])
             self.assertFalse((inbox/'finished.pcap').exists())
             self.assertFalse((inbox/'finished.json').exists())
         finally:
-            stop.set();worker.join(timeout=3);self.module.INBOX=original;mock_context.stop()
+            stop.set();worker.join(timeout=3);self.module.app.state.runtime.inbox=original;mock_context.stop()
 
 
 if __name__=='__main__':

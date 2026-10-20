@@ -13,7 +13,7 @@ A working local parental internet-activity monitoring prototype: **PCAP → meta
 
 The default **This PC · live** view shows real local activity for today. **Imported captures** is a separate view for files you import yourself. There is no sample-data mode, preloaded activity, or preloaded family rules. Choose yesterday in the date filter to see earlier history. Opening the Wireshark GUI alone does not feed this dashboard.
 
-The application binds only to this computer's loopback interface. Keep its terminal running. Press Ctrl+C in that terminal to stop it. If port 8765 is already in use, stop the other PacketParent server before launching this copy. Use one server and one capture helper at a time.
+The application binds only to this computer's loopback interface. Keep its terminal running. Press Ctrl+C in that terminal to stop it. If port 8765 is already in use, stop the other server or set `PACKETPARENT_PORT` to another free port. Use one server and one capture helper at a time.
 
 From a terminal in this folder:
 
@@ -93,14 +93,16 @@ Completed inbox file ─┘─> packets.py ─> service.py ─> SQLite
 |---|---|
 | `app.py` | HTTP routes, parent sessions, upload handling, inbox watcher |
 | `packets.py` | Capture-format parsing and observable network metadata |
-| `service.py` | Database, category matching, internet sessions, rules, alerts |
+| `service.py` | Database operations, incremental alerts and dashboard views |
+| `storage.py` | Backed-up schema migration, aggregation and fingerprint ledger |
+| `sessions.py`, `rules.py` | Pure session estimation, classification and rule evaluation |
 | `capture.py`, `capture_agent.py` | TShark segment capture and process lifecycle |
 | `local_monitor.py` | Shared data path, stable PC identity, adapter discovery, status |
 | `repair_history.py` | Backed-up repair of matching legacy local captures |
 | `static/` | Responsive dashboard and API client |
 | `tests/test_packetparent.py` | Parser, estimator, persistence, and API tests |
 
-SQLite tables: `config`, `devices`, `captures`, `events`, `rules`, and `alerts`. WAL mode is enabled, and application writes are serialized. Uploaded raw captures are parsed in memory; the application stores metadata rather than raw payloads. Files produced by the helper leave the inbox after successful ingestion; by default they are deleted.
+SQLite tables: `config`, `devices`, `captures`, `events`, `fingerprints`, `event_addresses`, `rules`, and `alerts`. WAL mode is enabled, and application writes are serialized. Uploaded raw captures are parsed in memory; the application stores metadata rather than raw payloads. Files produced by the helper leave the inbox after successful ingestion; by default they are deleted.
 
 By default the database is `data/packetparent.sqlite3`. The `PACKETPARENT_DATA` environment variable can redirect runtime data, including the inbox, to a separate directory. Do not share runtime data or a configured database as part of the source package.
 
@@ -139,7 +141,8 @@ The tests cover classic PCAP byte orders and timestamp precision, PCAPNG interfa
 For another local port:
 
 ```powershell
-python -m uvicorn app:app --host 127.0.0.1 --port 8766
+$env:PACKETPARENT_PORT = "8766"
+python app.py
 ```
 
 Live regression tests additionally cover multicast exclusion, IP changes, other-device rejection, cross-segment DNS expiry, source isolation, empty segments, backed-up history repair, and removal of legacy sample records.
@@ -215,3 +218,53 @@ visible/inferred domain are labeled `QUIC (encrypted)` in activity and alerts. T
 is a port-based indication, not verified QUIC identification. DNS-to-IP inference
 retains its explicit inference label when available. QUIC and encrypted DNS reduce
 domain visibility; no QUIC decryption is implemented.
+
+The server and `capture_agent.resolve_root()` both read `PACKETPARENT_PORT`
+(default 8765, valid range 1-65535). Set the same value in a separately launched
+capture terminal. If using Uvicorn directly, its `--port` must match the environment
+variable. The dashboard-launched helper inherits the setting automatically.
+
+Mutable authentication, watcher, store and capture-process state belongs to
+`app.state.runtime`. Session and rule helpers remain re-exported from `service.py`
+for compatibility. Dashboard response fields remain unchanged. The GitHub Actions
+workflow runs the unit suite on Ubuntu and Windows with Python 3.11 and 3.12.
+
+### Measured results for Tasks 0-6
+
+Measured locally on Windows / Python 3.11.9 using `tools/bench_scale.py`.
+Each run uses a fresh temporary database, one enabled domain rule, and twenty
+unique packets per second. Times exclude packet parsing and initial dataset seeding.
+Timings vary with hardware, caching and background load.
+
+| Raw packets | Event rows after 200-packet tail, before / after | Full rebuild, before / after | Snapshot, before / after | Tail import, before / after |
+|---:|---:|---:|---:|---:|
+| 100,000 | 100,200 / 5,010 | 0.724s / 0.057s | 0.609s / 0.038s | 0.721s / 0.073s |
+| 500,000 | 500,200 / 25,010 | 4.373s / 0.227s | 3.854s / 0.201s | 4.476s / 0.256s |
+| 1,000,000 | 1,000,200 / 50,010 | 8.405s / 0.418s | 5.970s / 0.356s | 6.750s / 0.473s |
+
+The event table is 20 times smaller on this workload. The separate per-packet
+fingerprint ledger still scales with retained packet volume; this is a row-count
+reduction in events, not a claim of 20 times less total database storage.
+
+`python tools/bench_scale.py --spread` fixes the current day's traffic at 100,000
+packets while adding older days. Tail import took 0.066s, 0.066s and 0.076s at
+100k, 500k and 1M total packets respectively. Re-evaluating a busy current day still
+costs more than a quiet one, but unrelated history is not scanned for alert matching.
+The complete measurements are in `tools/benchmark-before.txt`,
+`tools/benchmark-after.txt`, and `tools/benchmark-incremental.txt`.
+`benchmark-aggregation.txt` records an intermediate run that identified the slow
+address-ledger lookup, subsequently replaced with `event_addresses` summaries.
+
+Validation: 50 unit tests pass locally; JavaScript syntax and Git whitespace checks
+pass. The CI matrix is configured but has not been executed on GitHub from this
+checkout. Tests use synthetic frames and temporary stores; no real browsing data
+was used or exported for these benchmarks.
+
+No requested numbered task was intentionally omitted. QUIC decryption and a LICENSE
+file were deliberately not added, as requested. Remaining limits include port-based
+QUIC labeling, no stream/fragment reassembly, a fixed UTC offset, heuristic activity
+estimation, and manual cleanup of backups/processed/failed raw files. A sensor crash
+can leave an unfinished `.partial` file. Retention removes logical records, not
+forensically erases disk bytes; import receipts remain to recognize duplicate files.
+The existing Desktop installation has not been replaced by this branch, and this
+branch has not been published from the sandbox.

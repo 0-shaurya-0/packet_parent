@@ -7,58 +7,17 @@ from collections import Counter, defaultdict
 from contextlib import closing, contextmanager
 from pathlib import Path
 
+from catalog import CATALOG_VERSION, classify
+
+from storage import ingest, migrate, remove_capture_events
+
 from packets import CaptureError, clean_domain, parse_capture
 
-CATEGORIES = {
-    'Education': ['khanacademy.org', 'wikipedia.org', 'duolingo.com', 'coursera.org', 'edx.org', 'byjus.com', 'classroom.google.com'],
-    'Entertainment': ['youtube.com', 'googlevideo.com', 'netflix.com', 'nflxvideo.net', 'spotify.com', 'twitch.tv', 'hotstar.com'],
-    'Gaming': ['roblox.com', 'rbxcdn.com', 'steampowered.com', 'steamcontent.com', 'epicgames.com', 'minecraft.net', 'xboxlive.com'],
-    'Social': ['instagram.com', 'facebook.com', 'discord.com', 'discord.gg', 'reddit.com', 'snapchat.com', 'tiktok.com', 'whatsapp.com'],
-}
-DEFAULT_SETTINGS = {'idle_seconds': 120, 'utc_offset': 330, 'ignored_domains': ['windowsupdate.com', 'update.microsoft.com', 'time.windows.com']}
+# Re-export these helpers for existing callers.
+from sessions import day_bounds, estimate_sessions
+from rules import CATEGORIES, active, category, evaluate_rules, is_background, matches, window_contains
 
-
-def matches(domain, root):
-    return bool(domain and root and (domain == root or domain.endswith('.' + root)))
-
-
-def category(domain):
-    for name, roots in CATEGORIES.items():
-        if any(matches(domain, root) for root in roots):
-            return name
-    return 'Unknown'
-
-
-def estimate_sessions(timestamps, idle=120):
-    times = sorted(set(timestamps))
-    if not times:
-        return []
-    sessions, start, last = [], times[0], times[0]
-    for value in times[1:]:
-        if value - last > idle:
-            sessions.append((start, last))
-            start = value
-        last = value
-    sessions.append((start, last))
-    return sessions
-
-
-def window_contains(minute, start, end):
-    a = int(start[:2]) * 60 + int(start[3:])
-    b = int(end[:2]) * 60 + int(end[3:])
-    if a == b:
-        return True
-    return a <= minute < b if a < b else minute >= a or minute < b
-
-
-def day_bounds(day, offset):
-    tz = dt.timezone(dt.timedelta(minutes=offset))
-    start = dt.datetime.combine(dt.date.fromisoformat(day), dt.time(), tz).timestamp()
-    return start, start + 86400
-
-
-def active(row, settings):
-    return row['active'] and not any(matches(row['domain'], root) for root in settings['ignored_domains'])
+DEFAULT_SETTINGS = {'count_background_in_time': False, 'keep_raw_captures': False, 'retention_days': 90, 'idle_seconds': 120, 'utc_offset': 330, 'ignored_domains': ['windowsupdate.com', 'update.microsoft.com', 'time.windows.com']}
 
 
 class Store:
@@ -95,7 +54,23 @@ class Store:
                 db.execute('UPDATE events SET source_ip=device_ip')
             if 'source' not in {r[1] for r in db.execute('PRAGMA table_info(alerts)')}:
                 db.execute("ALTER TABLE alerts ADD COLUMN source TEXT NOT NULL DEFAULT 'import'")
+            db.execute('CREATE INDEX IF NOT EXISTS alert_source_day ON alerts(source,day)')
         self.remove_legacy_samples()
+        migrate(self)
+        self.refresh_catalog()
+
+    def refresh_catalog(self):
+        """Atomically recategorize historical rows once per catalog version."""
+        with self.lock, self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            version = db.execute("SELECT value FROM config WHERE key='catalog_version'").fetchone()
+            if version and version[0] == str(CATALOG_VERSION):
+                return False
+            db.create_function('catalog_category', 1, category, deterministic=True)
+            db.execute('UPDATE events SET category=catalog_category(domain)')
+            self.rebuild_alerts(db)
+            db.execute("INSERT OR REPLACE INTO config VALUES('catalog_version',?)", (str(CATALOG_VERSION),))
+            return True
 
     def remove_legacy_samples(self):
         """Remove only positively marked legacy samples, keeping a recoverable backup."""
@@ -117,7 +92,11 @@ class Store:
             if first_rules == defaults:
                 db.execute('DELETE FROM alerts WHERE rule_id IN (1,2,3)')
                 db.execute('DELETE FROM rules WHERE id IN (1,2,3)')
-            db.execute("DELETE FROM events WHERE capture_id IN (SELECT id FROM captures WHERE demo=1 OR source='demo')")
+            if 'packets' in {r[1] for r in db.execute('PRAGMA table_info(events)')}:
+                for capture_id in sample_ids:
+                    remove_capture_events(db, capture_id)
+            else:
+                db.execute("DELETE FROM events WHERE capture_id IN (SELECT id FROM captures WHERE demo=1 OR source='demo')")
             db.execute("DELETE FROM captures WHERE demo=1 OR source='demo'")
             self.rebuild_alerts(db)
             for ip in sample_devices:
@@ -151,9 +130,26 @@ class Store:
 
     def settings(self, db=None):
         if db is not None:
-            return json.loads(db.execute("SELECT value FROM config WHERE key='settings'").fetchone()[0])
+            return {**DEFAULT_SETTINGS, **json.loads(db.execute("SELECT value FROM config WHERE key='settings'").fetchone()[0])}
         with self.connect() as conn:
             return self.settings(conn)
+
+    def purge(self, now=None):
+        """Delete metadata older than the configured local-day retention boundary."""
+        with self.lock, self.connect() as db:
+            settings = self.settings(db)
+            days = settings['retention_days']
+            if not days:
+                return 0
+            tz = dt.timezone(dt.timedelta(minutes=settings['utc_offset']))
+            today = dt.datetime.fromtimestamp(now, tz).date() if now is not None else dt.datetime.now(tz).date()
+            cutoff_day = (today - dt.timedelta(days=days)).isoformat()
+            cutoff, _ = day_bounds(cutoff_day, settings['utc_offset'])
+            removed = db.execute('DELETE FROM events WHERE timestamp<?', (cutoff,)).rowcount
+            db.execute('DELETE FROM alerts WHERE day<?', (cutoff_day,))
+            if removed:
+                self.rebuild_alerts(db, {('live', cutoff_day), ('import', cutoff_day)})
+            return removed
 
     def auth_hash(self):
         with self.connect() as db:
@@ -186,80 +182,57 @@ class Store:
                 cur = db.execute('INSERT INTO captures(hash,name,imported,first,last,stats,demo,source) VALUES(?,?,?,?,?,?,?,?)',
                                  (digest, name[:180], dt.datetime.now().timestamp(), min((r['timestamp'] for r in rows), default=None),
                                   max((r['timestamp'] for r in rows), default=None), '{}', 0, source))
-                capture_id, inserted = cur.lastrowid, 0
-                for row in rows:
-                    ip = row['device_ip']
-                    db.execute('INSERT OR IGNORE INTO devices(ip,name) VALUES(?,?)', (ip, monitored['name'] if monitored else 'Device ' + ip))
-                    row['fingerprint'] = hashlib.sha256((source + ':' + row['fingerprint']).encode()).hexdigest()
-                    values = [row[k] for k in ('fingerprint', 'device_ip', 'timestamp', 'remote_ip', 'domain', 'protocol', 'evidence', 'active', 'bytes')]
-                    inserted += db.execute('''INSERT OR IGNORE INTO events(fingerprint,device_ip,timestamp,remote_ip,domain,
-                        protocol,evidence,active,bytes,capture_id,category,source_ip) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
-                        values + [capture_id, category(row['domain']), row['source_ip']]).rowcount
+                capture_id = cur.lastrowid
+                inserted = ingest(db, rows, capture_id, source, category,
+                                  monitored['name'] if monitored else None)
                 stats['inserted'] = inserted
                 stats['duplicates'] = len(rows) - inserted
                 db.execute('UPDATE captures SET stats=? WHERE id=?', (json.dumps(stats), capture_id))
-                self.rebuild_alerts(db)
+                if inserted:
+                    settings = self.settings(db)
+                    tz = dt.timezone(dt.timedelta(minutes=settings['utc_offset']))
+                    touched = set()
+                    for row in rows:
+                        for timestamp in (row['timestamp'] - settings['idle_seconds'],
+                                          row['timestamp'], row['timestamp'] + settings['idle_seconds']):
+                            touched.add((source, dt.datetime.fromtimestamp(timestamp, tz).date().isoformat()))
+                    self.rebuild_alerts(db, touched)
             return {'duplicate': False, 'id': capture_id, 'stats': stats, 'message': f'Imported {inserted:,} observations.'}
 
-    def rebuild_alerts(self, db):
+    def rebuild_alerts(self, db, pairs=None):
+        """Rebuild all alerts, or only affected source/day partitions with boundary context."""
+        if pairs is None:
+            self._evaluate_alerts(db)
+        else:
+            for source, day in sorted(pairs):
+                self._evaluate_alerts(db, source, day)
+
+    def _evaluate_alerts(self, db, source=None, day=None):
+        """Evaluate one day using adjacent activity to preserve midnight sessions."""
+        condition = '' if source is None else ' WHERE source=? AND day=?'
+        parameters = [] if source is None else [source, day]
         if not db.execute('SELECT 1 FROM rules WHERE enabled=1').fetchone():
-            db.execute('DELETE FROM alerts')
+            db.execute('DELETE FROM alerts' + condition, parameters)
             return
         settings = self.settings(db)
-        tz = dt.timezone(dt.timedelta(minutes=settings['utc_offset']))
-        rows = [dict(r) for r in db.execute('SELECT e.*,c.source FROM events e JOIN captures c ON c.id=e.capture_id ORDER BY timestamp')]
+        aggregated = 'packets' in {r[1] for r in db.execute('PRAGMA table_info(events)')}
+        order = 'first_ts' if aggregated else 'timestamp'
+        query = 'SELECT e.*,c.source FROM events e JOIN captures c ON c.id=e.capture_id'
+        values = []
+        if source is not None:
+            start, end = day_bounds(day, settings['utc_offset'])
+            source_column = 'e.source' if aggregated else 'c.source'
+            query += ' WHERE ' + source_column + '=? AND e.timestamp>=? AND e.timestamp<?'
+            values = [source, start - settings['idle_seconds'], end + settings['idle_seconds']]
+        rows = [dict(r) for r in db.execute(query + ' ORDER BY ' + order, values)]
+        requested_day = day
         rules = [dict(r) for r in db.execute('SELECT * FROM rules WHERE enabled=1')]
-        old_ack = {r['id']: r['acknowledged'] for r in db.execute('SELECT id,acknowledged FROM alerts')}
-        output, times = {}, defaultdict(list)
-        for row in rows:
-            local = dt.datetime.fromtimestamp(row['timestamp'], tz)
-            day, minute = local.date().isoformat(), local.hour * 60 + local.minute
-            if active(row, settings):
-                times[(row['source'], row['device_ip'])].append(row['timestamp'])
-            for rule in rules:
-                if rule['kind'] == 'budget' or (rule['device_ip'] and rule['device_ip'] != row['device_ip']):
-                    continue
-                if rule['kind'] == 'hours':
-                    hit = active(row, settings) and not window_contains(minute, rule['start'], rule['end'])
-                    reason = f"Observed internet traffic outside {rule['start']}–{rule['end']}."
-                else:
-                    hit = matches(row['domain'], rule['target']) if rule['kind'] == 'domain' else row['category'] == rule['target']
-                    if rule['start']:
-                        hit = hit and window_contains(minute, rule['start'], rule['end'])
-                    reason = f"Observed {row['domain']} matched the {rule['kind']} rule: {rule['target']}."
-                if not hit:
-                    continue
-                key = hashlib.sha256(f"{row['source']}|{rule['id']}|{row['device_ip']}|{day}|{row['domain'] or row['remote_ip']}".encode()).hexdigest()[:24]
-                if key in output:
-                    output[key]['count'] += 1
-                    output[key]['last_seen'] = row['timestamp']
-                else:
-                    output[key] = dict(id=key, rule_id=rule['id'], device_ip=row['device_ip'], day=day,
-                        timestamp=row['timestamp'], last_seen=row['timestamp'], domain=row['domain'] or row['remote_ip'],
-                        title=rule['name'], reason=reason, evidence=row['evidence'], count=1, source=row['source'])
-        for (source, ip), timestamps in times.items():
-            totals, lasts = Counter(), {}
-            for start, end in estimate_sessions(timestamps, settings['idle_seconds']):
-                cursor = start
-                while cursor < end:
-                    day = dt.datetime.fromtimestamp(cursor, tz).date().isoformat()
-                    _, boundary = day_bounds(day, settings['utc_offset'])
-                    stop = min(end, boundary)
-                    totals[day] += stop - cursor
-                    lasts[day] = stop
-                    cursor = stop
-            for rule in rules:
-                if rule['kind'] != 'budget' or (rule['device_ip'] and rule['device_ip'] != ip):
-                    continue
-                for day, seconds in totals.items():
-                    if seconds <= rule['minutes'] * 60:
-                        continue
-                    key = hashlib.sha256(f"{source}|{rule['id']}|{ip}|{day}|budget".encode()).hexdigest()[:24]
-                    output[key] = dict(id=key, rule_id=rule['id'], device_ip=ip, day=day, timestamp=lasts[day], last_seen=lasts[day], domain='',
-                        title=rule['name'], reason=f"Estimated internet-active time is {seconds / 60:.1f} minutes; daily limit is {rule['minutes']} minutes.",
-                        evidence='Payload activity sessions; background exclusions applied', count=1, source=source)
-        db.execute('DELETE FROM alerts')
-        for row in output.values():
+        old_ack = {r['id']: r['acknowledged'] for r in db.execute('SELECT id,acknowledged FROM alerts' + condition, parameters)}
+        output = evaluate_rules(rows, rules, settings)
+        db.execute('DELETE FROM alerts' + condition, parameters)
+        for row in output:
+            if requested_day is not None and row['day'] != requested_day:
+                continue
             row['acknowledged'] = old_ack.get(row['id'], 0)
             keys = list(row)
             db.execute('INSERT INTO alerts(' + ','.join(keys) + ') VALUES(' + ','.join('?' for _ in keys) + ')', list(row.values()))
@@ -287,64 +260,184 @@ class Store:
             db.execute("UPDATE config SET value=? WHERE key='settings'", (json.dumps(settings),))
             self.rebuild_alerts(db)
 
-    def snapshot(self, day=None, device='', source='all'):
+    def _snapshot_devices(self, db, source, local):
+        """Return device totals and observed addresses for the selected source."""
+        scope = '' if source == 'all' else ' AND e.source=?'
+        values = [] if source == 'all' else [source]
+        local_id = local.get('id', '') if source in ('live', 'all') else ''
+        devices = [dict(row) for row in db.execute(
+            'SELECT d.*,MAX(e.last_ts) last_seen,COALESCE(SUM(e.packets),0) observations '
+            'FROM devices d LEFT JOIN events e ON d.ip=e.device_ip' + scope +
+            ' GROUP BY d.ip HAVING COUNT(e.id)>0 OR d.ip=? ORDER BY d.name', values + [local_id])]
+        for item in devices:
+            item['addresses'] = [row[0] for row in db.execute(
+                'SELECT DISTINCT source_ip FROM event_addresses WHERE event_id IN '
+                '(SELECT e.id FROM events e WHERE device_ip=?' + scope + ') ORDER BY source_ip',
+                [item['ip']] + values)]
+            item['is_local'] = item['ip'] == local.get('id')
+        return devices
+
+    def _snapshot_sessions(self, rows, settings, start, end):
+        """Clip device sessions to the requested day and distribute them by hour."""
+        hourly = [0.0] * 24
+        sessions = []
+        device_seconds = Counter()
+        grouped = defaultdict(list)
+        for row in rows:
+            if active(row, settings):
+                grouped[row['device_ip']].extend([row['first_ts'], row['last_ts']])
+        for ip, timestamps in grouped.items():
+            for first, last in estimate_sessions(timestamps, settings['idle_seconds']):
+                first, last = max(first, start), min(last, end)
+                if last < first:
+                    continue
+                sessions.append({'device_ip': ip, 'start': first, 'end': last, 'seconds': last - first})
+                device_seconds[ip] += last - first
+                for hour in range(24):
+                    hourly[hour] += max(0, min(last, start + (hour + 1) * 3600) - max(first, start + hour * 3600))
+        return hourly, sorted(sessions, key=lambda row: row['start'], reverse=True), dict(device_seconds)
+
+    def _snapshot_activity(self, rows):
+        """Sum packet and byte counters by device, domain and evidence."""
+        domains = {}
+        for row in rows:
+            domain = row['domain'] or row['remote_ip']
+            key = (row['device_ip'], domain, row['evidence'])
+            if key not in domains:
+                domains[key] = {'device_ip': row['device_ip'], 'domain': domain, 'category': row['category'],
+                                'evidence': row['evidence'], 'first': row['first_ts'], 'last': row['last_ts'],
+                                'count': 0, 'bytes': 0,
+                                'service': classify(row['domain'])['service'],
+                                'noise': classify(row['domain'])['noise']}
+            item = domains[key]
+            item['last'] = max(item['last'], row['last_ts'])
+            item['first'] = min(item['first'], row['first_ts'])
+            item['count'] += row['packets']
+            item['bytes'] += row['bytes']
+        return sorted(domains.values(), key=lambda row: row['last'], reverse=True)
+
+    def _snapshot_services(self, rows, settings, start, end, include_background):
+        """Group payload evidence by device/service, retaining boundary session context."""
+        grouped = defaultdict(list)
+        labels = {}
+        for row in rows:
+            if row['evidence'] == 'DNS query':
+                continue
+            info = classify(row['domain'])
+            if is_background(row, settings):
+                if not include_background:
+                    continue
+                service_name = 'Background traffic (telemetry, ads, system)'
+                category_name = 'Unknown'
+            else:
+                service_name = info['service'] or ('Other websites' if row['domain'] else 'Unidentified connections')
+                category_name = info['category'] if info['service'] else 'Unknown'
+            key = (row['device_ip'], service_name)
+            grouped[key].append(row)
+            labels[key] = category_name
+
+        services = []
+        for (device_ip, service_name), observations in grouped.items():
+            timestamps = []
+            for row in observations:
+                if active(row, settings):
+                    timestamps.extend((row['first_ts'], row['last_ts']))
+            intervals = [(max(first, start), min(last, end))
+                         for first, last in estimate_sessions(timestamps, settings['idle_seconds'])
+                         if last >= start and first < end]
+            seconds = sum(max(0, last - first) for first, last in intervals)
+            day_rows = [row for row in observations if start <= row['timestamp'] < end]
+            if not day_rows and not seconds:
+                continue
+            domains = {}
+            for row in day_rows:
+                domain = row['domain'] or row['remote_ip']
+                if domain not in domains:
+                    domains[domain] = {'domain': domain, 'evidence': set(), 'packets': 0, 'last': row['last_ts']}
+                detail = domains[domain]
+                detail['evidence'].add(row['evidence'])
+                detail['packets'] += row['packets']
+                detail['last'] = max(detail['last'], row['last_ts'])
+            for detail in domains.values():
+                detail['evidence'] = '; '.join(sorted(detail['evidence']))
+            services.append({
+                'device_ip': device_ip, 'service': service_name, 'category': labels[(device_ip, service_name)],
+                'active_seconds': seconds,
+                'first': min((row['first_ts'] for row in day_rows), default=min((a for a, b in intervals), default=start)),
+                'last': max((row['last_ts'] for row in day_rows), default=max((b for a, b in intervals), default=start)),
+                'packets': sum(row['packets'] for row in day_rows),
+                'bytes': sum(row['bytes'] for row in day_rows),
+                'domains': sorted(domains.values(), key=lambda detail: (-detail['last'], detail['domain'])),
+            })
+        return sorted(services, key=lambda item: (-item['active_seconds'], item['service'], item['device_ip']))
+
+    def _snapshot_categories(self, rows, settings, start, end):
+        """Measure each category's union of active timestamps separately per device."""
+        grouped = defaultdict(list)
+        for row in rows:
+            if active(row, settings):
+                grouped[(row['device_ip'], row['category'])].extend((row['first_ts'], row['last_ts']))
+        totals = Counter()
+        for (_, category_name), timestamps in grouped.items():
+            seconds = sum(max(0, min(last, end) - max(first, start))
+                          for first, last in estimate_sessions(timestamps, settings['idle_seconds']))
+            if seconds:
+                totals[category_name] += seconds
+        return dict(totals)
+
+    def _snapshot_alerts(self, db, day, device, source):
+        """Read reviewed and outstanding alerts in the existing dashboard order."""
+        query = 'SELECT * FROM alerts WHERE day=?'
+        values = [day]
+        if source != 'all':
+            query += ' AND source=?'
+            values.append(source)
+        if device:
+            query += ' AND device_ip=?'
+            values.append(device)
+        return [dict(row) for row in db.execute(query + ' ORDER BY acknowledged,timestamp DESC', values)]
+
+    def snapshot(self, day=None, device='', source='all', include_background=False):
+        """Build one consistent dashboard view with the existing public response shape."""
         if source not in ('all', 'live', 'import'):
             raise ValueError('Invalid activity source.')
         with self.connect() as db:
+            db.execute('BEGIN')
             settings = self.settings(db)
             tz = dt.timezone(dt.timedelta(minutes=settings['utc_offset']))
-            scope = '' if source == 'all' else ' AND capture_id IN (SELECT id FROM captures WHERE source=?)'
+            scope = '' if source == 'all' else ' AND source=?'
             scope_values = [] if source == 'all' else [source]
-            dates = [r[0] for r in db.execute("SELECT DISTINCT date(timestamp + ?, 'unixepoch') FROM events WHERE 1=1" + scope + ' ORDER BY 1 DESC', [settings['utc_offset'] * 60] + scope_values)]
+            dates = [row[0] for row in db.execute(
+                "SELECT DISTINCT date(timestamp + ?, 'unixepoch') FROM events WHERE 1=1" + scope + ' ORDER BY 1 DESC',
+                [settings['utc_offset'] * 60] + scope_values)]
             today = dt.datetime.now(tz).date().isoformat()
             day = day or (today if source == 'live' else dates[0] if dates else today)
             start, end = day_bounds(day, settings['utc_offset'])
             local_row = db.execute("SELECT value FROM config WHERE key='local_device'").fetchone()
             local = json.loads(local_row[0]) if local_row else {}
-            devices = [dict(r) for r in db.execute('SELECT d.*,MAX(e.timestamp) last_seen,COUNT(e.id) observations FROM devices d LEFT JOIN events e ON d.ip=e.device_ip' + scope + ' GROUP BY d.ip HAVING COUNT(e.id)>0 OR d.ip=? ORDER BY d.name', scope_values + [local.get('id', '') if source in ('live', 'all') else ''])]
-            for item in devices:
-                item['addresses'] = [r[0] for r in db.execute('SELECT DISTINCT source_ip FROM events WHERE device_ip=?' + scope + ' ORDER BY source_ip', [item['ip']] + scope_values)]
-                item['is_local'] = item['ip'] == local.get('id')
-            rows = [dict(r) for r in db.execute('SELECT * FROM events WHERE timestamp>=? AND timestamp<?' + (' AND device_ip=?' if device else '') + ' ORDER BY timestamp',
-                [start - settings['idle_seconds'], end + settings['idle_seconds']] + ([device] if device else []))] if source == 'all' else [dict(r) for r in db.execute('SELECT * FROM events WHERE timestamp>=? AND timestamp<?' + scope + (' AND device_ip=?' if device else '') + ' ORDER BY timestamp', [start - settings['idle_seconds'], end + settings['idle_seconds']] + scope_values + ([device] if device else []))]
-            day_rows = [r for r in rows if start <= r['timestamp'] < end]
-            hourly, sessions, device_seconds = [0.0] * 24, [], Counter()
-            grouped = defaultdict(list)
-            for row in rows:
-                if active(row, settings):
-                    grouped[row['device_ip']].append(row['timestamp'])
-            for ip, timestamps in grouped.items():
-                for a, b in estimate_sessions(timestamps, settings['idle_seconds']):
-                    a, b = max(a, start), min(b, end)
-                    if b < a:
-                        continue
-                    sessions.append({'device_ip': ip, 'start': a, 'end': b, 'seconds': b - a})
-                    device_seconds[ip] += b - a
-                    for hour in range(24):
-                        hourly[hour] += max(0, min(b, start + (hour + 1) * 3600) - max(a, start + hour * 3600))
-            domains, categories = {}, Counter()
-            for row in day_rows:
-                domain = row['domain'] or row['remote_ip']
-                categories[row['category']] += 1
-                key = (row['device_ip'], domain, row['evidence'])
-                if key not in domains:
-                    domains[key] = {'device_ip': row['device_ip'], 'domain': domain, 'category': row['category'],
-                                    'evidence': row['evidence'], 'first': row['timestamp'], 'last': row['timestamp'], 'count': 0, 'bytes': 0}
-                domains[key]['last'] = row['timestamp']
-                domains[key]['count'] += 1
-                domains[key]['bytes'] += row['bytes']
-            source_condition = '' if source == 'all' else ' AND source=?'
-            alerts = [dict(r) for r in db.execute('SELECT * FROM alerts WHERE day=?' + source_condition + (' AND device_ip=?' if device else '') + ' ORDER BY acknowledged,timestamp DESC', [day] + scope_values + ([device] if device else []))]
-            captures = [dict(r) for r in db.execute('SELECT * FROM captures WHERE 1=1' + source_condition + ' ORDER BY imported DESC LIMIT 30', scope_values)]
+            devices = self._snapshot_devices(db, source, local)
+            query = 'SELECT * FROM events WHERE timestamp>=? AND timestamp<?' + scope
+            values = [start - settings['idle_seconds'], end + settings['idle_seconds']] + scope_values
+            if device:
+                query += ' AND device_ip=?'
+                values.append(device)
+            rows = [dict(row) for row in db.execute(query + ' ORDER BY timestamp', values)]
+            day_rows = [row for row in rows if start <= row['timestamp'] < end]
+            hourly, sessions, device_seconds = self._snapshot_sessions(rows, settings, start, end)
+            activity = self._snapshot_activity(day_rows)
+            services = self._snapshot_services(rows, settings, start, end, include_background)
+            categories = self._snapshot_categories(rows, settings, start, end)
+            alerts = self._snapshot_alerts(db, day, device, source)
+            captures = [dict(row) for row in db.execute(
+                'SELECT * FROM captures WHERE 1=1' + scope + ' ORDER BY imported DESC LIMIT 30', scope_values)]
             for capture in captures:
                 capture.pop('hash')
                 capture['stats'] = json.loads(capture['stats'])
             return {'source': source, 'day': day, 'today': today, 'dates': dates, 'devices': devices, 'settings': settings,
-                    'rules': [dict(r) for r in db.execute('SELECT * FROM rules ORDER BY id')],
-                    'alerts': alerts, 'captures': captures, 'hourly': hourly, 'sessions': sorted(sessions, key=lambda s: s['start'], reverse=True),
-                    'activity': sorted(domains.values(), key=lambda r: r['last'], reverse=True),
-                    'categories': dict(categories), 'device_seconds': dict(device_seconds),
-                    'summary': {'seconds': sum(device_seconds.values()), 'observations': len(day_rows),
-                                'domains': len({r['domain'] for r in day_rows if r['domain']}),
-                                'unacknowledged': sum(not a['acknowledged'] for a in alerts),
-                                'unknown': sum(not r['domain'] for r in day_rows)}}
+                    'rules': [dict(row) for row in db.execute('SELECT * FROM rules ORDER BY id')],
+                    'alerts': alerts, 'captures': captures, 'hourly': hourly, 'sessions': sessions,
+                    'activity': activity, 'services': services, 'categories': categories, 'device_seconds': device_seconds,
+                    'summary': {'seconds': sum(device_seconds.values()), 'observations': sum(row['packets'] for row in day_rows),
+                                'domains': len({row['domain'] for row in day_rows if row['domain']}),
+                                'unacknowledged': sum(not alert['acknowledged'] for alert in alerts),
+                                'unknown': sum(row['packets'] for row in day_rows if not row['domain'])}}

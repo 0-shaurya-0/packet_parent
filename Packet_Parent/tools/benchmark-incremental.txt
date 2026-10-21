@@ -1,0 +1,3 @@
+spread=True raw=100,000 rows_after_tail=5,010 rebuild=0.048s snapshot=0.041s tail_import=0.066s
+spread=True raw=500,000 rows_after_tail=25,010 rebuild=0.224s snapshot=0.062s tail_import=0.066s
+spread=True raw=1,000,000 rows_after_tail=50,010 rebuild=0.406s snapshot=0.085s tail_import=0.076s

@@ -219,11 +219,23 @@ def transport(frame, link):
         proto, pos = p[6], 40
         end = min(len(p), 40 + int.from_bytes(p[4:6], 'big'))
         for _ in range(8):
-            if proto not in (0, 43, 60):
+            if proto not in (0, 43, 44, 51, 60):
                 break
             if pos + 2 > end:
                 return None
-            proto, length = p[pos], (p[pos + 1] + 1) * 8
+            if proto == 44:
+                if pos + 8 > end or int.from_bytes(p[pos + 2:pos + 4], 'big') & 0xfff8:
+                    return None
+                length = 8
+            elif proto == 51:
+                length = (p[pos + 1] + 2) * 4
+                if length < 12:
+                    return None
+            else:
+                length = (p[pos + 1] + 1) * 8
+            if pos + length > end:
+                return None
+            proto = p[pos]
             pos += length
         body = p[pos:end]
     else:
@@ -335,6 +347,8 @@ def parse_capture(data, monitored=None, state=None):
                     name, expiry = cache[(device, remote)]
                     if ts <= expiry:
                         domain, evidence = name, 'DNS-to-IP inference'
+                if proto == 'UDP' and remote_port == 443 and not domain:
+                    evidence = 'QUIC (encrypted)'
                 active = True
             fingerprint = hashlib.sha256(struct.pack('!d', ts) + frame).hexdigest()
             rows.append({'fingerprint': fingerprint, 'timestamp': ts, 'device_ip': monitored['id'] if monitored else device,

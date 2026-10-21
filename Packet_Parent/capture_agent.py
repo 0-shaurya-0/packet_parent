@@ -7,13 +7,14 @@ import subprocess
 import time
 import urllib.request
 
-from local_monitor import capture_context, data_directory, interfaces, tshark_path, write_status
+from local_monitor import capture_context, data_directory, interfaces, tshark_path, write_status, server_port
 
 
 def resolve_root():
     root = data_directory()
+    port = server_port()
     try:
-        with urllib.request.urlopen('http://127.0.0.1:8765/api/health', timeout=2) as response:
+        with urllib.request.urlopen(f'http://127.0.0.1:{port}/api/health', timeout=2) as response:
             health = json.load(response)
         if health.get('application') == 'PacketParent' and health.get('data_dir'):
             active = Path(health['data_dir']).resolve()
@@ -30,9 +31,13 @@ def main():
     parser.add_argument('--list', action='store_true', help='List capture interfaces')
     parser.add_argument('--managed', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--interface', help='Interface number or name from --list')
+    parser.add_argument('--snaplen', type=int, default=os.environ.get('PACKETPARENT_SNAPLEN', '2048'),
+                        help='Bytes captured per packet (64-262144; default 2048)')
     parser.add_argument('--seconds', type=int, default=10)
     parser.add_argument('--segments', type=int, default=0, help='Stop after this many segments (0: continuous)')
     args = parser.parse_args()
+    if not 64 <= args.snaplen <= 262144:
+        parser.error('--snaplen must be between 64 and 262144 bytes.')
     exe = tshark_path()
     if not exe:
         parser.error('Install Wireshark with TShark and Npcap first.')
@@ -66,6 +71,7 @@ def main():
     if not args.managed:
         stop_file.unlink(missing_ok=True)
     process = None
+    partial = None
     status = {'state': 'starting', 'pid': os.getpid(), 'interface': chosen['label'], 'last_file': None, 'error': None}
     write_status(root, status)
     print(f"Monitoring this PC on {chosen['label']}. Inbox: {inbox}", flush=True)
@@ -81,7 +87,7 @@ def main():
             terms = ['ether host ' + mac for mac in context['macs']] or ['host ' + ip for ip in context['ips']]
             command = [exe, '-i', chosen['name'], '-p', '-f', '(' + ' or '.join(terms) + ')',
                        '-a', f'duration:{args.seconds}', '-a', 'filesize:20000', '-a', 'packets:100000',
-                       '-s', '2048', '-F', 'pcap', '-w', str(partial), '-q']
+                       '-s', str(args.snaplen), '-F', 'pcap', '-w', str(partial), '-q']
             status.update(state='recording', addresses=context['ips'], error=None)
             with (root / 'tshark.log').open('w', encoding='utf-8') as log:
                 process = subprocess.Popen(command, stdout=log, stderr=log,
@@ -119,6 +125,9 @@ def main():
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 process.kill()
+                process.wait(timeout=5)
+        if partial is not None:
+            partial.unlink(missing_ok=True)
         if status['state'] != 'error':
             status['state'] = 'stopped'
         status.pop('capture_pid', None)

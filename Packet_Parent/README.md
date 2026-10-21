@@ -13,7 +13,7 @@ A working local parental internet-activity monitoring prototype: **PCAP → meta
 
 The default **This PC · live** view shows real local activity for today. **Imported captures** is a separate view for files you import yourself. There is no sample-data mode, preloaded activity, or preloaded family rules. Choose yesterday in the date filter to see earlier history. Opening the Wireshark GUI alone does not feed this dashboard.
 
-The application binds only to this computer's loopback interface. Keep its terminal running. Press Ctrl+C in that terminal to stop it. If port 8765 is already in use, stop the other PacketParent server before launching this copy. Use one server and one capture helper at a time.
+The application binds only to this computer's loopback interface. Keep its terminal running. Press Ctrl+C in that terminal to stop it. If port 8765 is already in use, stop the other server or set `PACKETPARENT_PORT` to another free port. Use one server and one capture helper at a time.
 
 From a terminal in this folder:
 
@@ -72,7 +72,7 @@ python capture.py --list
 python capture.py --interface 1
 ```
 
-Replace `1` with the desired interface from the list. Keep the dashboard server running too. The helper captures ten-second segments, then moves completed files into `data/inbox`. The server watches that folder and automatically imports completed captures. Capture files remain there until you remove them. The helper uses a 2,048-byte snapshot limit, a local MAC capture filter, and non-promiscuous mode. Segments are bounded by duration, file size, and packet count. Large or split handshakes may still be truncated. Stopping discards the unfinished segment; completed history is retained.
+Replace `1` with the desired interface from the list. Keep the dashboard server running too. The helper captures ten-second segments, then moves completed files into `data/inbox`. The server watches that folder and automatically imports completed captures. Successfully imported segments and their JSON identity sidecars are deleted by default. Enable Keep raw captures in Settings to move them to `data/processed/` instead. The helper uses a configurable snapshot limit (default 2,048 bytes), a local MAC capture filter, and non-promiscuous mode. Segments are bounded by duration, file size, and packet count. Large or split handshakes may still be truncated. Stopping discards the unfinished segment; completed history is retained.
 
 The dashboard distinguishes the inbox watcher from a running capture sensor. Short capture gaps can occur while the helper restarts TShark between segments. The local Windows WiFi → TShark → inbox → SQLite → dashboard flow was verified with a real capture. The helper reads the running dashboard’s data directory, and refuses an explicitly conflicting PACKETPARENT_DATA setting. Each data directory permits one sensor process at a time.
 
@@ -93,14 +93,16 @@ Completed inbox file ─┘─> packets.py ─> service.py ─> SQLite
 |---|---|
 | `app.py` | HTTP routes, parent sessions, upload handling, inbox watcher |
 | `packets.py` | Capture-format parsing and observable network metadata |
-| `service.py` | Database, category matching, internet sessions, rules, alerts |
+| `service.py` | Database operations, incremental alerts and dashboard views |
+| `storage.py` | Backed-up schema migration, aggregation and fingerprint ledger |
+| `sessions.py`, `rules.py` | Pure session estimation, classification and rule evaluation |
 | `capture.py`, `capture_agent.py` | TShark segment capture and process lifecycle |
 | `local_monitor.py` | Shared data path, stable PC identity, adapter discovery, status |
 | `repair_history.py` | Backed-up repair of matching legacy local captures |
 | `static/` | Responsive dashboard and API client |
 | `tests/test_packetparent.py` | Parser, estimator, persistence, and API tests |
 
-SQLite tables: `config`, `devices`, `captures`, `events`, `rules`, and `alerts`. WAL mode is enabled, and application writes are serialized. Uploaded raw captures are parsed in memory; the application stores metadata rather than raw payloads. Files produced by the optional capture helper are retained in the inbox.
+SQLite tables: `config`, `devices`, `captures`, `events`, `fingerprints`, `event_addresses`, `rules`, and `alerts`. WAL mode is enabled, and application writes are serialized. Uploaded raw captures are parsed in memory; the application stores metadata rather than raw payloads. Files produced by the helper leave the inbox after successful ingestion; by default they are deleted.
 
 By default the database is `data/packetparent.sqlite3`. The `PACKETPARENT_DATA` environment variable can redirect runtime data, including the inbox, to a separate directory. Do not share runtime data or a configured database as part of the source package.
 
@@ -125,7 +127,7 @@ Stop monitoring and the server, then run `python repair_history.py` from the pro
 - Day boundaries and rule schedules use a fixed UTC offset, initialized from the browser. Daylight saving adjustments are manual.
 - Capture timestamps establish when activity was observed; the system does not claim complete monitoring coverage or infer that missing data means offline time.
 - One local parent account; no cloud synchronization, multiple household accounts, or remote access configuration.
-- There is no automatic metadata retention policy or password-recovery workflow in this prototype. Keep the source package separate from `data`.
+- There is no password-recovery workflow in this prototype. Keep the source package separate from `data`.
 
 ## Tests
 
@@ -139,7 +141,8 @@ The tests cover classic PCAP byte orders and timestamp precision, PCAPNG interfa
 For another local port:
 
 ```powershell
-python -m uvicorn app:app --host 127.0.0.1 --port 8766
+$env:PACKETPARENT_PORT = "8766"
+python app.py
 ```
 
 Live regression tests additionally cover multicast exclusion, IP changes, other-device rejection, cross-segment DNS expiry, source isolation, empty segments, backed-up history repair, and removal of legacy sample records.
@@ -147,3 +150,202 @@ Live regression tests additionally cover multicast exclusion, IP changes, other-
 ## Existing sample records
 
 On startup, older captures explicitly marked as synthetic demo data are removed from the active database after a SQLite backup is saved in `data/backups`. Their observations, alerts, and unused device entries are removed too. The original three untouched sample rules are removed when their complete original set is identifiable. Custom or edited rules are preserved. Real captures, passwords, settings, and device names you entered are preserved. A real device that shared a sample IP keeps its observations; its unchanged sample label is reset. Automated packet fixtures live only under `tests/` and cannot populate the dashboard.
+
+### Scale benchmark
+Run python tools/bench_scale.py for temporary 100k, 500k and 1M observation datasets (twenty packets per second, one domain rule). It measures full alert rebuild, a daily snapshot, and a 200-packet tail import. Parser time is excluded. Baseline measurements are saved in tools/benchmark-before.txt.
+
+
+### Aggregated metadata and migration
+Events are grouped by source (live/import), device, whole second, remote IP, domain,
+protocol, evidence and activity flag. Packet and byte counters preserve observation
+totals. Exact first/last timestamps preserve subsecond session endpoints; aggregating
+within one second does not bridge a gap larger than the minimum session threshold.
+A compact fingerprint ledger retains duplicate detection across overlapping/re-encoded
+captures, capture ownership, timestamps, byte counts and observed device addresses.
+It still has one entry per unique packet; event aggregation does not make disk usage
+independent of packet volume. No packet payload is stored in SQLite.
+
+Existing per-packet databases are backed up with SQLite's backup API into
+`data/backups/before-aggregation-*.sqlite3` before an atomic migration. Restarting
+an already migrated database does not repeat the migration or backup. Empty databases
+need no backup. Keep enough free disk space for the backup and migration. Backups
+contain historical metadata and must be protected like the live database.
+
+Imports recompute alerts only for the affected source/local days, including adjacent
+midnight days within the session threshold. Indexed source/time queries read only
+those days and their boundary context. More traffic on the same day can still increase
+that day's evaluation cost; unrelated older history does not require re-evaluation.
+Rule and settings changes deliberately rebuild all alerts. Stable alert IDs preserve
+reviewed flags whenever the corresponding alert still exists.
+
+### Privacy settings and retention
+
+Settings exposes `keep_raw_captures` (boolean, default false) and `retention_days`
+(integer 0-36500, default 90; zero keeps metadata forever). PUT `/api/settings`
+validates both. Saving settings applies retention immediately. At server startup
+and once per UTC calendar day while running, events before local midnight N days
+ago and their alerts are removed, including their fingerprint/address entries.
+The first retained day is reevaluated so an expired session cannot extend its time.
+Capture import receipts/hashes remain for duplicate-file detection; device names,
+rules and settings remain. Deleted observations are no longer deduplicated against
+a differently encoded old capture, so importing one again can restore old history
+until the next purge. Same-file reimports remain duplicate receipts.
+
+Backups and files deliberately kept in `data/processed/` are not automatically
+purged; remove them manually when no longer needed. SQLite deletion is logical,
+not guaranteed forensic erasure; unused pages, WAL, filesystem copies and backups
+may retain old bytes. Raw uploads are parsed in memory. Interrupted helper segments
+are deleted when the helper exits normally; a crash may leave a `.partial` file
+in the data folder, which needs manual removal.
+
+Use `python capture.py --interface 1 --snaplen 1024`, or set
+`PACKETPARENT_SNAPLEN=1024` before starting the dashboard/helper. Valid values are
+64-262144 bytes; the default remains 2048. Smaller values reduce captured payload
+but can truncate TLS ClientHellos and hide server names. This does not decrypt TLS.
+
+### Failed imports
+The watcher waits for a file to be unchanged across two polls. Failed inputs and
+sidecars move to `data/failed/`, alongside a small `.error.txt`; they are not retried.
+Later files continue processing. The dashboard shows the latest failure until the
+next successful import. Quarantined raw data can contain payload and is kept for
+manual diagnosis/removal, outside metadata retention. If filesystem permissions
+prevent quarantine, the error includes that failure and the unchanged input is
+suppressed for the current server run. Fix permissions before restarting.
+
+IPv6 parsing recognizes Fragment and Authentication headers. Non-first fragments
+are skipped; there is still no fragment reassembly. UDP/443 connections without a
+visible/inferred domain are labeled `QUIC (encrypted)` in activity and alerts. This
+is a port-based indication, not verified QUIC identification. DNS-to-IP inference
+retains its explicit inference label when available. QUIC and encrypted DNS reduce
+domain visibility; no QUIC decryption is implemented.
+
+The server and `capture_agent.resolve_root()` both read `PACKETPARENT_PORT`
+(default 8765, valid range 1-65535). Set the same value in a separately launched
+capture terminal. If using Uvicorn directly, its `--port` must match the environment
+variable. The dashboard-launched helper inherits the setting automatically.
+
+Mutable authentication, watcher, store and capture-process state belongs to
+`app.state.runtime`. Session and rule helpers remain re-exported from `service.py`
+for compatibility. Dashboard response fields remain unchanged. The GitHub Actions
+workflow runs the unit suite on Ubuntu and Windows with Python 3.11 and 3.12.
+
+### Measured results for Tasks 0-6
+
+Measured locally on Windows / Python 3.11.9 using `tools/bench_scale.py`.
+Each run uses a fresh temporary database, one enabled domain rule, and twenty
+unique packets per second. Times exclude packet parsing and initial dataset seeding.
+Timings vary with hardware, caching and background load.
+
+| Raw packets | Event rows after 200-packet tail, before / after | Full rebuild, before / after | Snapshot, before / after | Tail import, before / after |
+|---:|---:|---:|---:|---:|
+| 100,000 | 100,200 / 5,010 | 0.724s / 0.057s | 0.609s / 0.038s | 0.721s / 0.073s |
+| 500,000 | 500,200 / 25,010 | 4.373s / 0.227s | 3.854s / 0.201s | 4.476s / 0.256s |
+| 1,000,000 | 1,000,200 / 50,010 | 8.405s / 0.418s | 5.970s / 0.356s | 6.750s / 0.473s |
+
+The event table is 20 times smaller on this workload. The separate per-packet
+fingerprint ledger still scales with retained packet volume; this is a row-count
+reduction in events, not a claim of 20 times less total database storage.
+
+`python tools/bench_scale.py --spread` fixes the current day's traffic at 100,000
+packets while adding older days. Tail import took 0.066s, 0.066s and 0.076s at
+100k, 500k and 1M total packets respectively. Re-evaluating a busy current day still
+costs more than a quiet one, but unrelated history is not scanned for alert matching.
+The complete measurements are in `tools/benchmark-before.txt`,
+`tools/benchmark-after.txt`, and `tools/benchmark-incremental.txt`.
+`benchmark-aggregation.txt` records an intermediate run that identified the slow
+address-ledger lookup, subsequently replaced with `event_addresses` summaries.
+
+Validation: 50 unit tests pass locally; JavaScript syntax and Git whitespace checks
+pass. The CI matrix is configured but has not been executed on GitHub from this
+checkout. Tests use synthetic frames and temporary stores; no real browsing data
+was used or exported for these benchmarks.
+
+No requested numbered task was intentionally omitted. QUIC decryption and a LICENSE
+file were deliberately not added, as requested. Remaining limits include port-based
+QUIC labeling, no stream/fragment reassembly, a fixed UTC offset, heuristic activity
+estimation, and manual cleanup of backups/processed/failed raw files. A sensor crash
+can leave an unfinished `.partial` file. Retention removes logical records, not
+forensically erases disk bytes; import receipts remain to recognize duplicate files.
+The existing Desktop installation has not been replaced by this branch, and this
+branch has not been published from the sandbox.
+
+## Service catalog
+A versioned local catalog in `catalog.py` groups YouTube assets, Microsoft Teams &
+Office, ChatGPT and Google Search. Productivity and AI are available as rule
+categories. Existing categories and the Unknown fallback remain valid. Matching
+uses explicit domain-label boundaries, with exact host exceptions for Google
+Search so other Google products are not mislabeled. Only explicit telemetry, ad
+and system endpoints are background; ordinary CDNs are not automatically noise.
+NTP hostnames and captive-portal checks are covered; the parser's existing exclusion
+of UDP/123 is unchanged. No captured events are deleted by classification.
+
+On startup a catalog-version change recategorizes all existing events and rebuilds
+alerts in one transaction. Repeated startup with the same version is a no-op.
+Ingestion and history use the same classifier. Increment CATALOG_VERSION when
+editing entries. Service attribution is heuristic: live.com, ggpht.com, graph and
+shared Office hosts can serve several products; a service label does not prove a
+specific page, Teams meeting or video was viewed.
+
+`count_background_in_time` is a boolean setting (default false), accepted by
+PUT /api/settings. Catalog telemetry, ads and system traffic then contribute
+neither internet-active time, budget alerts nor outside-hours alerts. Opting in
+counts catalog background payload activity again. Explicit `ignored_domains`
+remain excluded regardless of that opt-in, and are also treated as background
+for presentation. DNS-only lookups never count as usage. Domain and category
+rules still evaluate every stored row, including background traffic and lookups.
+
+### Service activity API
+GET /api/dashboard now includes `services`, grouped separately per device and day.
+Each entry includes device_ip, service, category, active_seconds, first, last,
+packets, bytes and domain details (domain, evidence, packets, last). Packets/bytes
+and domain details are for that day; session estimation also reads adjacent-day
+context and clips elapsed time at midnight. A session crossing an otherwise empty
+day boundary can have time with zero in-day packets. Multiple evidence types for
+one domain are combined in its detail.
+
+Unmapped identified domains appear under Other websites; IP-only activity appears
+under Unidentified connections, with distinct IPs in the domain details. Both use
+the Unknown compatibility category. DNS-only lookups are excluded from services.
+The default excludes catalog and user-configured background; add
+`include_background=true` to show a Background traffic (telemetry, ads, system)
+group. This display toggle does not change timing settings or rule evaluation.
+
+The existing `activity` field remains unfiltered and now includes service and noise
+(catalog classification) on every row. User-configured exclusions can be background
+even when catalog noise is null. No metadata, fingerprints, or packet counters
+are removed by these views.
+
+`categories` now measures active seconds, calculated from each category's per-device
+timeline, not packet counts. Times for different services can overlap. Category
+times can overlap too: neither sum is the device total. The device total still uses
+the single whole-device timeline. A lone payload observation has zero estimated
+duration; DNS lookups are not proof of use.
+
+Activity now opens with Service, Category, Active time and Last seen, sorted by
+active time. Each service expands to its domains/IPs, evidence and packet counts.
+The off-by-default Show background traffic toggle requests include_background;
+raw detail is separately expandable and always includes DNS and background.
+The overview chart uses category active time. Settings exposes the separate
+Count catalog background traffic in time control. Local PDFs may produce no
+network activity, so this view cannot confirm that a document was read.
+
+### Service-view regression verification
+The realistic test fixture contains 33 observations and 18 raw activity entries.
+The default Activity view groups them into 5 services; enabling background adds
+one group (6 entries total). All 33 observations remain available to raw views and
+rule evaluation. The full suite passes 60 tests, including the original 50 tests
+without changed assertions, catalog boundaries, atomic/idempotent migration,
+midnight/device separation, API validation, and noise-aware hours/budget rules.
+Browser verification also checked service expansion and the background toggle.
+
+The Overview page also shows the five most active services with active time and
+last seen, linking to Internet activity for domain evidence. Durations under one
+minute display seconds. A versioned static asset URL refreshes the UI after this
+change; reload the browser page if it was already open.
+
+Catalog labels are conservative heuristics: ggpht.com can serve shared Google
+assets, live.com and Office hosts cover several Microsoft products, and openai.com
+can represent API or company-site traffic as well as ChatGPT. These requested
+families are grouped together, not treated as proof of a specific user action.
+Google Search matches only google.com and www.google.com, leaving unrelated
+Google subdomains available for other classifications. No requested task was skipped.

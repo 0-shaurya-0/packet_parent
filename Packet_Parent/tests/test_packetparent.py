@@ -301,6 +301,24 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(values['keep_raw_captures'])
         self.assertEqual(values['retention_days'], 0)
 
+    def test_service_api_and_background_settings(self):
+        """The API exposes services, accepts new categories and validates background controls."""
+        from test_services import import_rows, session_rows
+        self.setup_parent()
+        import_rows(self.module.app.state.runtime.store, session_rows())
+        url = '/api/dashboard?source=import&day=2026-10-14'
+        self.assertEqual(len(self.client.get(url).json()['services']), 5)
+        self.assertEqual(len(self.client.get(url+'&include_background=true').json()['services']), 6)
+        self.assertEqual(self.client.get(url+'&include_background=invalid').status_code, 422)
+        for category in ('Productivity', 'AI'):
+            response = self.client.post('/api/rules', json={'name': category, 'kind': 'category', 'target': category}, headers=self.headers)
+            self.assertEqual(response.status_code, 200)
+        response = self.client.put('/api/settings', json={'count_background_in_time': 'true'}, headers=self.headers)
+        self.assertEqual(response.status_code, 400)
+        response = self.client.put('/api/settings', json={'count_background_in_time': True, 'retention_days': 0}, headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(self.client.get(url).json()['settings']['count_background_in_time'])
+
     def test_completed_inbox_file_is_imported(self):
         self.setup_parent()
         original=self.module.app.state.runtime.inbox

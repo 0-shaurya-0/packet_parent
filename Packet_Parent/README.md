@@ -328,3 +328,19 @@ raw detail is separately expandable and always includes DNS and background.
 The overview chart uses category active time. Settings exposes the separate
 Count catalog background traffic in time control. Local PDFs may produce no
 network activity, so this view cannot confirm that a document was read.
+
+### Service-view regression verification
+The realistic test fixture contains 33 observations and 18 raw activity entries.
+The default Activity view groups them into 5 services; enabling background adds
+one group (6 entries total). All 33 observations remain available to raw views and
+rule evaluation. The full suite passes 60 tests, including the original 50 tests
+without changed assertions, catalog boundaries, atomic/idempotent migration,
+midnight/device separation, API validation, and noise-aware hours/budget rules.
+Browser verification also checked service expansion and the background toggle.
+
+Catalog labels are conservative heuristics: ggpht.com can serve shared Google
+assets, live.com and Office hosts cover several Microsoft products, and openai.com
+can represent API or company-site traffic as well as ChatGPT. These requested
+families are grouped together, not treated as proof of a specific user action.
+Google Search matches only google.com and www.google.com, leaving unrelated
+Google subdomains available for other classifications. No requested task was skipped.

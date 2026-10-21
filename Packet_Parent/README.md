@@ -268,3 +268,20 @@ can leave an unfinished `.partial` file. Retention removes logical records, not
 forensically erases disk bytes; import receipts remain to recognize duplicate files.
 The existing Desktop installation has not been replaced by this branch, and this
 branch has not been published from the sandbox.
+
+## Service catalog
+A versioned local catalog in `catalog.py` groups YouTube assets, Microsoft Teams &
+Office, ChatGPT and Google Search. Productivity and AI are available as rule
+categories. Existing categories and the Unknown fallback remain valid. Matching
+uses explicit domain-label boundaries, with exact host exceptions for Google
+Search so other Google products are not mislabeled. Only explicit telemetry, ad
+and system endpoints are background; ordinary CDNs are not automatically noise.
+NTP hostnames and captive-portal checks are covered; the parser's existing exclusion
+of UDP/123 is unchanged. No captured events are deleted by classification.
+
+On startup a catalog-version change recategorizes all existing events and rebuilds
+alerts in one transaction. Repeated startup with the same version is a no-op.
+Ingestion and history use the same classifier. Increment CATALOG_VERSION when
+editing entries. Service attribution is heuristic: live.com, ggpht.com, graph and
+shared Office hosts can serve several products; a service label does not prove a
+specific page, Teams meeting or video was viewed.

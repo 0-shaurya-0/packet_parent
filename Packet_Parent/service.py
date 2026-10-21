@@ -7,6 +7,8 @@ from collections import Counter, defaultdict
 from contextlib import closing, contextmanager
 from pathlib import Path
 
+from catalog import CATALOG_VERSION, classify
+
 from storage import ingest, migrate, remove_capture_events
 
 from packets import CaptureError, clean_domain, parse_capture
@@ -55,6 +57,20 @@ class Store:
             db.execute('CREATE INDEX IF NOT EXISTS alert_source_day ON alerts(source,day)')
         self.remove_legacy_samples()
         migrate(self)
+        self.refresh_catalog()
+
+    def refresh_catalog(self):
+        """Atomically recategorize historical rows once per catalog version."""
+        with self.lock, self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            version = db.execute("SELECT value FROM config WHERE key='catalog_version'").fetchone()
+            if version and version[0] == str(CATALOG_VERSION):
+                return False
+            db.create_function('catalog_category', 1, category, deterministic=True)
+            db.execute('UPDATE events SET category=catalog_category(domain)')
+            self.rebuild_alerts(db)
+            db.execute("INSERT OR REPLACE INTO config VALUES('catalog_version',?)", (str(CATALOG_VERSION),))
+            return True
 
     def remove_legacy_samples(self):
         """Remove only positively marked legacy samples, keeping a recoverable backup."""

@@ -2,7 +2,7 @@
 const $ = (selector) => document.querySelector(selector);
 const esc = (value) => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const icon = (name) => `<svg aria-hidden="true"><use href="#i-${name}"/></svg>`;
-const colors = {Education:'#8fa878',Entertainment:'#d4ba82',Gaming:'#b4a4cb',Social:'#8aadb8',Unknown:'#d3d8cc'};
+const colors = {Education:'#8fa878',Entertainment:'#d4ba82',Gaming:'#b4a4cb',Social:'#8aadb8',Productivity:'#78a9a5',AI:'#9a8ccc',Unknown:'#d3d8cc'};
 const titles = {overview:['Your family, connected.','A clearer picture of your family’s internet activity.','Overview'],activity:['Every connection, in context.','Explore the network activity observed in your captures.','Internet activity'],alerts:['A moment to check in.','Understand which family rules matched observed activity.','Alerts'],rules:['Boundaries that fit your family.','Set domain, category, schedule, and internet-time rules.','Family rules'],devices:['Meet your connected devices.','Give each observed device a name and a family member.','Devices'],captures:['From packets to perspective.','Import a network capture to start understanding activity.','Capture library'],settings:['Make it work for your family.','Tune how internet activity is grouped and measured.','Settings']};
 let monitorLoaded = false, followToday = true;
 let state = null, view = 'overview', authenticated = false, setupDone = false, refreshBusy = false, refreshPending = false, toastTimer;

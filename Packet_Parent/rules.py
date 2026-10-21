@@ -5,24 +5,16 @@ from collections import Counter, defaultdict
 
 from sessions import day_bounds, estimate_sessions
 
-CATEGORIES = {
-    'Education': ['khanacademy.org', 'wikipedia.org', 'duolingo.com', 'coursera.org', 'edx.org', 'byjus.com', 'classroom.google.com'],
-    'Entertainment': ['youtube.com', 'googlevideo.com', 'netflix.com', 'nflxvideo.net', 'spotify.com', 'twitch.tv', 'hotstar.com'],
-    'Gaming': ['roblox.com', 'rbxcdn.com', 'steampowered.com', 'steamcontent.com', 'epicgames.com', 'minecraft.net', 'xboxlive.com'],
-    'Social': ['instagram.com', 'facebook.com', 'discord.com', 'discord.gg', 'reddit.com', 'snapchat.com', 'tiktok.com', 'whatsapp.com'],
-}
+from catalog import CATEGORY_DOMAINS, classify
+from domain_names import matches
 
-def matches(domain, root):
-    """Match a domain and its subdomains on label boundaries."""
-    return bool(domain and root and (domain == root or domain.endswith('.' + root)))
+# Public compatibility alias; validation uses these category names.
+CATEGORIES = CATEGORY_DOMAINS
 
 
 def category(domain):
-    """Classify visible domains using the local category list."""
-    for name, roots in CATEGORIES.items():
-        if any(matches(domain, root) for root in roots):
-            return name
-    return 'Unknown'
+    """Use the same catalog category for ingestion and historical recategorization."""
+    return classify(domain)['category']
 
 
 def window_contains(minute, start, end):

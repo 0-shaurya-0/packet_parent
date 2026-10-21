@@ -288,10 +288,10 @@ def logout(request: Request):
 
 
 @app.get('/api/dashboard')
-def dashboard(day: str = '', device: str = '', source: str = 'live'):
+def dashboard(day: str = '', device: str = '', source: str = 'live', include_background: bool = False):
     runtime = app.state.runtime
     try:
-        result = runtime.store.snapshot(day or None, device, source)
+        result = runtime.store.snapshot(day or None, device, source, include_background)
     except (ValueError, OverflowError):
         raise HTTPException(400, 'Use a valid date in YYYY-MM-DD format.')
     result['watcher'] = runtime.watch_status

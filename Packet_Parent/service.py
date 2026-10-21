@@ -15,7 +15,7 @@ from packets import CaptureError, clean_domain, parse_capture
 
 # Re-export these helpers for existing callers.
 from sessions import day_bounds, estimate_sessions
-from rules import CATEGORIES, active, category, evaluate_rules, matches, window_contains
+from rules import CATEGORIES, active, category, evaluate_rules, is_background, matches, window_contains
 
 DEFAULT_SETTINGS = {'count_background_in_time': False, 'keep_raw_captures': False, 'retention_days': 90, 'idle_seconds': 120, 'utc_offset': 330, 'ignored_domains': ['windowsupdate.com', 'update.microsoft.com', 'time.windows.com']}
 
@@ -300,21 +300,90 @@ class Store:
     def _snapshot_activity(self, rows):
         """Sum packet and byte counters by device, domain and evidence."""
         domains = {}
-        categories = Counter()
         for row in rows:
             domain = row['domain'] or row['remote_ip']
-            categories[row['category']] += row['packets']
             key = (row['device_ip'], domain, row['evidence'])
             if key not in domains:
                 domains[key] = {'device_ip': row['device_ip'], 'domain': domain, 'category': row['category'],
                                 'evidence': row['evidence'], 'first': row['first_ts'], 'last': row['last_ts'],
-                                'count': 0, 'bytes': 0}
+                                'count': 0, 'bytes': 0,
+                                'service': classify(row['domain'])['service'],
+                                'noise': classify(row['domain'])['noise']}
             item = domains[key]
             item['last'] = max(item['last'], row['last_ts'])
             item['first'] = min(item['first'], row['first_ts'])
             item['count'] += row['packets']
             item['bytes'] += row['bytes']
-        return sorted(domains.values(), key=lambda row: row['last'], reverse=True), dict(categories)
+        return sorted(domains.values(), key=lambda row: row['last'], reverse=True)
+
+    def _snapshot_services(self, rows, settings, start, end, include_background):
+        """Group payload evidence by device/service, retaining boundary session context."""
+        grouped = defaultdict(list)
+        labels = {}
+        for row in rows:
+            if row['evidence'] == 'DNS query':
+                continue
+            info = classify(row['domain'])
+            if is_background(row, settings):
+                if not include_background:
+                    continue
+                service_name = 'Background traffic (telemetry, ads, system)'
+                category_name = 'Unknown'
+            else:
+                service_name = info['service'] or ('Other websites' if row['domain'] else 'Unidentified connections')
+                category_name = info['category'] if info['service'] else 'Unknown'
+            key = (row['device_ip'], service_name)
+            grouped[key].append(row)
+            labels[key] = category_name
+
+        services = []
+        for (device_ip, service_name), observations in grouped.items():
+            timestamps = []
+            for row in observations:
+                if active(row, settings):
+                    timestamps.extend((row['first_ts'], row['last_ts']))
+            intervals = [(max(first, start), min(last, end))
+                         for first, last in estimate_sessions(timestamps, settings['idle_seconds'])
+                         if last >= start and first < end]
+            seconds = sum(max(0, last - first) for first, last in intervals)
+            day_rows = [row for row in observations if start <= row['timestamp'] < end]
+            if not day_rows and not seconds:
+                continue
+            domains = {}
+            for row in day_rows:
+                domain = row['domain'] or row['remote_ip']
+                if domain not in domains:
+                    domains[domain] = {'domain': domain, 'evidence': set(), 'packets': 0, 'last': row['last_ts']}
+                detail = domains[domain]
+                detail['evidence'].add(row['evidence'])
+                detail['packets'] += row['packets']
+                detail['last'] = max(detail['last'], row['last_ts'])
+            for detail in domains.values():
+                detail['evidence'] = '; '.join(sorted(detail['evidence']))
+            services.append({
+                'device_ip': device_ip, 'service': service_name, 'category': labels[(device_ip, service_name)],
+                'active_seconds': seconds,
+                'first': min((row['first_ts'] for row in day_rows), default=min((a for a, b in intervals), default=start)),
+                'last': max((row['last_ts'] for row in day_rows), default=max((b for a, b in intervals), default=start)),
+                'packets': sum(row['packets'] for row in day_rows),
+                'bytes': sum(row['bytes'] for row in day_rows),
+                'domains': sorted(domains.values(), key=lambda detail: (-detail['last'], detail['domain'])),
+            })
+        return sorted(services, key=lambda item: (-item['active_seconds'], item['service'], item['device_ip']))
+
+    def _snapshot_categories(self, rows, settings, start, end):
+        """Measure each category's union of active timestamps separately per device."""
+        grouped = defaultdict(list)
+        for row in rows:
+            if active(row, settings):
+                grouped[(row['device_ip'], row['category'])].extend((row['first_ts'], row['last_ts']))
+        totals = Counter()
+        for (_, category_name), timestamps in grouped.items():
+            seconds = sum(max(0, min(last, end) - max(first, start))
+                          for first, last in estimate_sessions(timestamps, settings['idle_seconds']))
+            if seconds:
+                totals[category_name] += seconds
+        return dict(totals)
 
     def _snapshot_alerts(self, db, day, device, source):
         """Read reviewed and outstanding alerts in the existing dashboard order."""
@@ -328,7 +397,7 @@ class Store:
             values.append(device)
         return [dict(row) for row in db.execute(query + ' ORDER BY acknowledged,timestamp DESC', values)]
 
-    def snapshot(self, day=None, device='', source='all'):
+    def snapshot(self, day=None, device='', source='all', include_background=False):
         """Build one consistent dashboard view with the existing public response shape."""
         if source not in ('all', 'live', 'import'):
             raise ValueError('Invalid activity source.')
@@ -355,7 +424,9 @@ class Store:
             rows = [dict(row) for row in db.execute(query + ' ORDER BY timestamp', values)]
             day_rows = [row for row in rows if start <= row['timestamp'] < end]
             hourly, sessions, device_seconds = self._snapshot_sessions(rows, settings, start, end)
-            activity, categories = self._snapshot_activity(day_rows)
+            activity = self._snapshot_activity(day_rows)
+            services = self._snapshot_services(rows, settings, start, end, include_background)
+            categories = self._snapshot_categories(rows, settings, start, end)
             alerts = self._snapshot_alerts(db, day, device, source)
             captures = [dict(row) for row in db.execute(
                 'SELECT * FROM captures WHERE 1=1' + scope + ' ORDER BY imported DESC LIMIT 30', scope_values)]
@@ -365,7 +436,7 @@ class Store:
             return {'source': source, 'day': day, 'today': today, 'dates': dates, 'devices': devices, 'settings': settings,
                     'rules': [dict(row) for row in db.execute('SELECT * FROM rules ORDER BY id')],
                     'alerts': alerts, 'captures': captures, 'hourly': hourly, 'sessions': sessions,
-                    'activity': activity, 'categories': categories, 'device_seconds': device_seconds,
+                    'activity': activity, 'services': services, 'categories': categories, 'device_seconds': device_seconds,
                     'summary': {'seconds': sum(device_seconds.values()), 'observations': sum(row['packets'] for row in day_rows),
                                 'domains': len({row['domain'] for row in day_rows if row['domain']}),
                                 'unacknowledged': sum(not alert['acknowledged'] for alert in alerts),

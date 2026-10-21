@@ -293,3 +293,30 @@ counts catalog background payload activity again. Explicit `ignored_domains`
 remain excluded regardless of that opt-in, and are also treated as background
 for presentation. DNS-only lookups never count as usage. Domain and category
 rules still evaluate every stored row, including background traffic and lookups.
+
+### Service activity API
+GET /api/dashboard now includes `services`, grouped separately per device and day.
+Each entry includes device_ip, service, category, active_seconds, first, last,
+packets, bytes and domain details (domain, evidence, packets, last). Packets/bytes
+and domain details are for that day; session estimation also reads adjacent-day
+context and clips elapsed time at midnight. A session crossing an otherwise empty
+day boundary can have time with zero in-day packets. Multiple evidence types for
+one domain are combined in its detail.
+
+Unmapped identified domains appear under Other websites; IP-only activity appears
+under Unidentified connections, with distinct IPs in the domain details. Both use
+the Unknown compatibility category. DNS-only lookups are excluded from services.
+The default excludes catalog and user-configured background; add
+`include_background=true` to show a Background traffic (telemetry, ads, system)
+group. This display toggle does not change timing settings or rule evaluation.
+
+The existing `activity` field remains unfiltered and now includes service and noise
+(catalog classification) on every row. User-configured exclusions can be background
+even when catalog noise is null. No metadata, fingerprints, or packet counters
+are removed by these views.
+
+`categories` now measures active seconds, calculated from each category's per-device
+timeline, not packet counts. Times for different services can overlap. Category
+times can overlap too: neither sum is the device total. The device total still uses
+the single whole-device timeline. A lone payload observation has zero estimated
+duration; DNS lookups are not proof of use.

@@ -26,9 +26,19 @@ def window_contains(minute, start, end):
     return a <= minute < b if a < b else minute >= a or minute < b
 
 
+def is_background(row, settings):
+    """Identify catalog noise and parent-configured background domains."""
+    return bool(classify(row['domain'])['noise'] or
+                any(matches(row['domain'], root) for root in settings['ignored_domains']))
+
+
 def active(row, settings):
-    """Apply background-domain exclusions to payload activity."""
-    return row['active'] and not any(matches(row['domain'], root) for root in settings['ignored_domains'])
+    """Exclude lookups, explicit exclusions and optionally catalog background noise."""
+    if not row['active'] or row['evidence'] == 'DNS query':
+        return False
+    if any(matches(row['domain'], root) for root in settings['ignored_domains']):
+        return False
+    return settings.get('count_background_in_time', False) or classify(row['domain'])['noise'] is None
 
 
 def evaluate_rules(rows, rules, settings):

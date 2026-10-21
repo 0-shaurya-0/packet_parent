@@ -450,7 +450,10 @@ async def settings(request: Request):
     keep = data.get('keep_raw_captures', runtime.store.settings()['keep_raw_captures'])
     if type(keep) is not bool:
         raise HTTPException(400, 'keep_raw_captures must be true or false.')
-    values = {'keep_raw_captures': keep,
+    count_background = data.get('count_background_in_time', runtime.store.settings()['count_background_in_time'])
+    if type(count_background) is not bool:
+        raise HTTPException(400, 'count_background_in_time must be true or false.')
+    values = {'count_background_in_time': count_background, 'keep_raw_captures': keep,
               'retention_days': integer(data, 'retention_days', 0, 36500, runtime.store.settings()['retention_days']),
               'idle_seconds': integer(data, 'idle_seconds', 30, 600, 120),
               'utc_offset': integer(data, 'utc_offset', -720, 840, 330),

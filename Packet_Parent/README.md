@@ -285,3 +285,11 @@ Ingestion and history use the same classifier. Increment CATALOG_VERSION when
 editing entries. Service attribution is heuristic: live.com, ggpht.com, graph and
 shared Office hosts can serve several products; a service label does not prove a
 specific page, Teams meeting or video was viewed.
+
+`count_background_in_time` is a boolean setting (default false), accepted by
+PUT /api/settings. Catalog telemetry, ads and system traffic then contribute
+neither internet-active time, budget alerts nor outside-hours alerts. Opting in
+counts catalog background payload activity again. Explicit `ignored_domains`
+remain excluded regardless of that opt-in, and are also treated as background
+for presentation. DNS-only lookups never count as usage. Domain and category
+rules still evaluate every stored row, including background traffic and lookups.

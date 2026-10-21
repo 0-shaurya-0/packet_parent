@@ -17,7 +17,7 @@ from packets import CaptureError, clean_domain, parse_capture
 from sessions import day_bounds, estimate_sessions
 from rules import CATEGORIES, active, category, evaluate_rules, matches, window_contains
 
-DEFAULT_SETTINGS = {'keep_raw_captures': False, 'retention_days': 90, 'idle_seconds': 120, 'utc_offset': 330, 'ignored_domains': ['windowsupdate.com', 'update.microsoft.com', 'time.windows.com']}
+DEFAULT_SETTINGS = {'count_background_in_time': False, 'keep_raw_captures': False, 'retention_days': 90, 'idle_seconds': 120, 'utc_offset': 330, 'ignored_domains': ['windowsupdate.com', 'update.microsoft.com', 'time.windows.com']}
 
 
 class Store:

@@ -338,6 +338,11 @@ without changed assertions, catalog boundaries, atomic/idempotent migration,
 midnight/device separation, API validation, and noise-aware hours/budget rules.
 Browser verification also checked service expansion and the background toggle.
 
+The Overview page also shows the five most active services with active time and
+last seen, linking to Internet activity for domain evidence. Durations under one
+minute display seconds. A versioned static asset URL refreshes the UI after this
+change; reload the browser page if it was already open.
+
 Catalog labels are conservative heuristics: ggpht.com can serve shared Google
 assets, live.com and Office hosts cover several Microsoft products, and openai.com
 can represent API or company-site traffic as well as ChatGPT. These requested

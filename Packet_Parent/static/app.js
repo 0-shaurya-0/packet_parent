@@ -28,6 +28,10 @@ function duration(seconds, markup = false) {
   if (seconds > 0 && seconds < 60) return markup ? '&lt;1 <small>min</small>' : '<1 min';
   return markup ? (hours ? `${hours}<small>h</small> ${minutes % 60}<small>m</small>` : `${minutes}<small> min</small>`) : (hours ? `${hours}h ${minutes % 60}m` : `${minutes} min`);
 }
+function serviceDuration(seconds) {
+  if (seconds < 60) return `${Math.round(Math.max(0, seconds))} sec`;
+  return duration(seconds);
+}
 function clock(timestamp) {
   if (timestamp === null || timestamp === undefined) return '—';
   return new Date((timestamp + (state?.settings.utc_offset || 0) * 60) * 1000).toLocaleTimeString('en', {timeZone:'UTC',hour:'2-digit',minute:'2-digit',hour12:false});
@@ -109,13 +113,20 @@ $('#show-background').addEventListener('change', event => {
 
 function metrics() {
   const s = state.summary;
-  const items = [ ['Estimated internet-active time',duration(s.seconds,true),'Combined device time · overlapping apps merged','clock',true], ['Domains observed',s.domains.toLocaleString(),`${s.observations.toLocaleString()} network observations`,'globe'],['Open alerts',s.unacknowledged,'Rule matches awaiting your review','bell'],['Registered devices',state.devices.length,state.source === 'live' ? 'This PC keeps one identity across IP changes' : 'In the selected activity source','device'] ];
+  const services = state.services.filter(row => row.service !== 'Background traffic (telemetry, ads, system)');
+  const items = [ ['Estimated internet-active time',duration(s.seconds,true),'Combined device time · overlapping apps merged','clock',true], ['Services used',services.length,'Grouped from observed connections','globe'],['Open alerts',s.unacknowledged,'Rule matches awaiting your review','bell'],['Registered devices',state.devices.length,state.source === 'live' ? 'This PC keeps one identity across IP changes' : 'In the selected activity source','device'] ];
   return `<div class="metrics">${items.map(([name,value,sub,i,featured]) => `<div class="metric ${featured?'featured':''}"><div class="metric-top"><span>${name}</span>${icon(i)}</div><div class="metric-value">${value}</div><div class="metric-sub">${sub}</div></div>`).join('')}</div>`;
 }
 function activityTable(rows, limit = 0) {
   const selected = limit ? rows.slice(0,limit) : rows.slice(0,500);
   if (!selected.length) return empty('No activity in this view.','Choose another date or device, or import a capture to see observations.');
   return `<div class="table-wrap"><table><thead><tr><th>DOMAIN / CONNECTION</th><th>DEVICE</th><th>CATEGORY</th><th>LAST SEEN</th><th>PACKETS</th></tr></thead><tbody>${selected.map(r => `<tr><td><div class="domain-cell"><span class="site-icon">${esc(r.domain[0])}</span><span>${esc(r.domain)}<small>${esc(r.evidence)}</small></span></div></td><td>${esc(deviceName(r.device_ip))}</td><td>${categoryBadge(r.category)}</td><td>${clock(r.last)}</td><td>${r.count.toLocaleString()}</td></tr>`).join('')}</tbody></table></div>`;
+}
+function serviceSummaryTable(rows) {
+  const selected = rows.filter(row => row.service !== 'Background traffic (telemetry, ads, system)')
+    .sort((a, b) => b.active_seconds - a.active_seconds).slice(0, 5);
+  if (!selected.length) return empty('No service activity in this view.', 'Only DNS lookups or background traffic may have been observed.');
+  return `<div class="table-wrap"><table><thead><tr><th>SERVICE</th><th>CATEGORY</th><th>ACTIVE TIME</th><th>LAST SEEN</th></tr></thead><tbody>${selected.map(row => `<tr><td><b>${esc(row.service)}</b><small class="service-device">${esc(deviceName(row.device_ip))}</small></td><td>${categoryBadge(row.category)}</td><td>${serviceDuration(row.active_seconds)}</td><td>${clock(row.last)}</td></tr>`).join('')}</tbody></table></div>`;
 }
 function renderOverview() {
   const node = $('#view-overview');
@@ -125,7 +136,7 @@ function renderOverview() {
   const recent = state.alerts.filter(a=>!a.acknowledged).slice(0,2);
   node.innerHTML = metrics() + `<div class="main-grid"><div class="card card-pad"><div class="card-head"><div><h2>A day on the internet</h2><p>Estimated active minutes by hour · ${timezoneLabel()}</p></div><span class="legend-small"><i></i>Internet activity</span></div><div class="chart" role="img" aria-label="Hourly estimated internet-active time">${state.hourly.map((s,h)=>`<div class="bar-slot" title="${String(h).padStart(2,'0')}:00 — ${duration(s)} across selected devices"><div class="bar ${s?'':'is-empty'}" style="height:${Math.max(2,s/maximum*100)}%"></div></div>`).join('')}</div><div class="chart-labels"><span>00:00</span><span>04:00</span><span>08:00</span><span>12:00</span><span>16:00</span><span>20:00</span><span>23:00</span></div><div class="chart-note">A ${state.settings.idle_seconds}-second quiet period separates sessions. No idle tail is added.</div></div>
   <div class="card card-pad"><div class="card-head"><div><h2>What’s in the mix?</h2><p>Share of category active time · categories may overlap</p></div></div><div class="category-content"><div class="donut" style="background:${total?`conic-gradient(${gradient})`:'#edf1e8'}"><div class="donut-label">${Object.keys(state.categories).length}<small>CATEGORIES</small></div></div><div class="category-legend">${Object.entries(state.categories).sort((a,b)=>b[1]-a[1]).map(([name,value])=>`<div class="category-row"><i style="background:${colors[name]}"></i>${name}<strong>${duration(value)} · ${Math.round(value/(total||1)*100)}%</strong></div>`).join('') || '<p class="form-hint">No active time for this date.</p>'}</div></div><div class="chart-note">Categories use a small local domain list. Unmatched domains stay Unknown.</div></div></div>
-  <div class="card table-card"><div class="card-head"><div><h2>Recent internet activity</h2><p>A little context behind the connections</p></div><button class="button subtle" data-action="view" data-target="activity">View all ${icon('arrow')}</button></div>${activityTable(state.activity,5)}<div class="table-footer">Observed traffic does not confirm that a page was actively viewed. Encrypted content stays private.</div></div>
+  <div class="card table-card"><div class="card-head"><div><h2>Services used</h2><p>Estimated active time by service</p></div><button class="button subtle" data-action="view" data-target="activity">View all ${icon('arrow')}</button></div>${serviceSummaryTable(state.services)}<div class="table-footer">Times for different services can overlap. Open Internet activity to see domain evidence and packet counts.</div></div>
   <div class="bottom-grid"><div class="card card-pad"><div class="card-head"><div><h2>Worth a check-in</h2><p>Recent rule matches</p></div><button class="button subtle" data-action="view" data-target="alerts">All alerts ${icon('arrow')}</button></div>${recent.map(a=>`<div class="alert-preview"><div class="alert-symbol">${icon('bell')}</div><div class="alert-copy"><b>${esc(a.title)}</b><p>${esc(deviceName(a.device_ip))} · ${esc(a.domain || 'Daily usage')}</p><small>${clock(a.timestamp)} · ${esc(a.evidence)}</small></div></div>`).join('') || '<p class="form-hint">No open alerts for the selected date and device.</p>'}</div><div class="card card-pad insight-card"><div class="eyebrow">THE BIGGER PICTURE</div><h2>Good habits begin<br>with understanding.</h2><p>Use these observations to start a conversation. Internet time is an estimate; background traffic and buffered content can affect it.</p><button class="button subtle" data-action="view" data-target="rules">Review your family rules ${icon('arrow')}</button></div></div>`;
 }
 function serviceKey(row) {
@@ -135,7 +146,7 @@ function serviceTable(rows) {
   if (!rows.length) return empty('No service activity in this view.', 'Only DNS lookups or background traffic may have been observed. Raw detail remains available below.');
   return `<div class="table-wrap"><table><thead><tr><th>SERVICE</th><th>CATEGORY</th><th>ACTIVE TIME</th><th>LAST SEEN</th></tr></thead><tbody>${rows.map((row, index) => {
     const key = serviceKey(row), expanded = expandedServices.has(key);
-    return `<tr><td><button class="text-button service-expand" data-action="service-detail" data-key="${esc(key)}" aria-expanded="${expanded}" aria-controls="service-detail-${index}">${expanded ? '▾' : '▸'} ${esc(row.service)}</button><small class="service-device">${esc(deviceName(row.device_ip))}</small></td><td>${categoryBadge(row.category)}</td><td>${duration(row.active_seconds)}</td><td>${clock(row.last)}</td></tr>
+    return `<tr><td><button class="text-button service-expand" data-action="service-detail" data-key="${esc(key)}" aria-expanded="${expanded}" aria-controls="service-detail-${index}">${expanded ? '▾' : '▸'} ${esc(row.service)}</button><small class="service-device">${esc(deviceName(row.device_ip))}</small></td><td>${categoryBadge(row.category)}</td><td>${serviceDuration(row.active_seconds)}</td><td>${clock(row.last)}</td></tr>
     <tr id="service-detail-${index}" class="service-detail ${expanded ? '' : 'hidden'}"><td colspan="4"><table><thead><tr><th>DOMAIN / IP</th><th>EVIDENCE</th><th>PACKETS</th><th>LAST SEEN</th></tr></thead><tbody>${row.domains.map(domain => `<tr><td>${esc(domain.domain)}</td><td>${esc(domain.evidence)}</td><td>${domain.packets.toLocaleString()}</td><td>${clock(domain.last)}</td></tr>`).join('') || '<tr><td colspan="4">Session crosses this day; no packets were observed inside it.</td></tr>'}</tbody></table></td></tr>`;
   }).join('')}</tbody></table></div>`;
 }

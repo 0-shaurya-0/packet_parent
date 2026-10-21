@@ -4,7 +4,8 @@ const esc = (value) => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;
 const icon = (name) => `<svg aria-hidden="true"><use href="#i-${name}"/></svg>`;
 const colors = {Education:'#8fa878',Entertainment:'#d4ba82',Gaming:'#b4a4cb',Social:'#8aadb8',Productivity:'#78a9a5',AI:'#9a8ccc',Unknown:'#d3d8cc'};
 const titles = {overview:['Your family, connected.','A clearer picture of your family’s internet activity.','Overview'],activity:['Every connection, in context.','Explore the network activity observed in your captures.','Internet activity'],alerts:['A moment to check in.','Understand which family rules matched observed activity.','Alerts'],rules:['Boundaries that fit your family.','Set domain, category, schedule, and internet-time rules.','Family rules'],devices:['Meet your connected devices.','Give each observed device a name and a family member.','Devices'],captures:['From packets to perspective.','Import a network capture to start understanding activity.','Capture library'],settings:['Make it work for your family.','Tune how internet activity is grouped and measured.','Settings']};
-let monitorLoaded = false, followToday = true;
+let monitorLoaded = false, followToday = true, includeBackground = false;
+const expandedServices = new Set();
 let state = null, view = 'overview', authenticated = false, setupDone = false, refreshBusy = false, refreshPending = false, toastTimer;
 
 async function api(path, options = {}) {
@@ -71,9 +72,10 @@ async function refresh(force = false) {
   try {
     const requestedDay = $('#date-filter').value, requestedDevice = $('#device-filter').value;
     const source = $('#source-filter').value;
-    const query = new URLSearchParams({day:source === 'live' && followToday ? '' : requestedDay,device:requestedDevice,source});
+    const requestedBackground = includeBackground;
+    const query = new URLSearchParams({day:source === 'live' && followToday ? '' : requestedDay,device:requestedDevice,source,include_background:String(requestedBackground)});
     const result = await api('/dashboard?' + query);
-    if (source !== $('#source-filter').value || requestedDay !== $('#date-filter').value || requestedDevice !== $('#device-filter').value) { refreshPending = true; return; }
+    if (requestedBackground !== includeBackground || source !== $('#source-filter').value || requestedDay !== $('#date-filter').value || requestedDevice !== $('#device-filter').value) { refreshPending = true; return; }
     state = result;
     const previous = $('#device-filter').value;
     $('#device-filter').innerHTML = deviceOptions(previous);
@@ -100,6 +102,10 @@ $('#device-filter').addEventListener('change', () => refresh(true));
 $('#date-filter').addEventListener('change', () => { followToday = $('#date-filter').value === state?.today; refresh(true); });
 $('#source-filter').addEventListener('change', () => { followToday = true; $('#date-filter').value = ''; $('#device-filter').value = ''; refresh(true); });
 $('#activity-search').addEventListener('input', renderActivity);
+$('#show-background').addEventListener('change', event => {
+  includeBackground = event.target.checked;
+  refresh(true);
+});
 
 function metrics() {
   const s = state.summary;
@@ -109,7 +115,7 @@ function metrics() {
 function activityTable(rows, limit = 0) {
   const selected = limit ? rows.slice(0,limit) : rows.slice(0,500);
   if (!selected.length) return empty('No activity in this view.','Choose another date or device, or import a capture to see observations.');
-  return `<div class="table-wrap"><table><thead><tr><th>DOMAIN / CONNECTION</th><th>DEVICE</th><th>CATEGORY</th><th>LAST SEEN</th><th>OBSERVATIONS</th></tr></thead><tbody>${selected.map(r => `<tr><td><div class="domain-cell"><span class="site-icon">${esc(r.domain[0])}</span><span>${esc(r.domain)}<small>${esc(r.evidence)}</small></span></div></td><td>${esc(deviceName(r.device_ip))}</td><td>${categoryBadge(r.category)}</td><td>${clock(r.last)}</td><td>${r.count.toLocaleString()}</td></tr>`).join('')}</tbody></table></div>`;
+  return `<div class="table-wrap"><table><thead><tr><th>DOMAIN / CONNECTION</th><th>DEVICE</th><th>CATEGORY</th><th>LAST SEEN</th><th>PACKETS</th></tr></thead><tbody>${selected.map(r => `<tr><td><div class="domain-cell"><span class="site-icon">${esc(r.domain[0])}</span><span>${esc(r.domain)}<small>${esc(r.evidence)}</small></span></div></td><td>${esc(deviceName(r.device_ip))}</td><td>${categoryBadge(r.category)}</td><td>${clock(r.last)}</td><td>${r.count.toLocaleString()}</td></tr>`).join('')}</tbody></table></div>`;
 }
 function renderOverview() {
   const node = $('#view-overview');
@@ -118,16 +124,35 @@ function renderOverview() {
   let position = 0; const gradient = Object.entries(state.categories).map(([name,value]) => { const old=position; position += value/(total||1)*100; return `${colors[name]} ${old}% ${position}%`; }).join(',');
   const recent = state.alerts.filter(a=>!a.acknowledged).slice(0,2);
   node.innerHTML = metrics() + `<div class="main-grid"><div class="card card-pad"><div class="card-head"><div><h2>A day on the internet</h2><p>Estimated active minutes by hour · ${timezoneLabel()}</p></div><span class="legend-small"><i></i>Internet activity</span></div><div class="chart" role="img" aria-label="Hourly estimated internet-active time">${state.hourly.map((s,h)=>`<div class="bar-slot" title="${String(h).padStart(2,'0')}:00 — ${duration(s)} across selected devices"><div class="bar ${s?'':'is-empty'}" style="height:${Math.max(2,s/maximum*100)}%"></div></div>`).join('')}</div><div class="chart-labels"><span>00:00</span><span>04:00</span><span>08:00</span><span>12:00</span><span>16:00</span><span>20:00</span><span>23:00</span></div><div class="chart-note">A ${state.settings.idle_seconds}-second quiet period separates sessions. No idle tail is added.</div></div>
-  <div class="card card-pad"><div class="card-head"><div><h2>What’s in the mix?</h2><p>Share of category active time · categories may overlap</p></div></div><div class="category-content"><div class="donut" style="background:${total?`conic-gradient(${gradient})`:'#edf1e8'}"><div class="donut-label">${Object.keys(state.categories).length}<small>CATEGORIES</small></div></div><div class="category-legend">${Object.entries(state.categories).sort((a,b)=>b[1]-a[1]).map(([name,value])=>`<div class="category-row"><i style="background:${colors[name]}"></i>${name}<strong>${Math.round(value/(total||1)*100)}%</strong></div>`).join('') || '<p class="form-hint">No active time for this date.</p>'}</div></div><div class="chart-note">Categories use a small local domain list. Unmatched domains stay Unknown.</div></div></div>
+  <div class="card card-pad"><div class="card-head"><div><h2>What’s in the mix?</h2><p>Share of category active time · categories may overlap</p></div></div><div class="category-content"><div class="donut" style="background:${total?`conic-gradient(${gradient})`:'#edf1e8'}"><div class="donut-label">${Object.keys(state.categories).length}<small>CATEGORIES</small></div></div><div class="category-legend">${Object.entries(state.categories).sort((a,b)=>b[1]-a[1]).map(([name,value])=>`<div class="category-row"><i style="background:${colors[name]}"></i>${name}<strong>${duration(value)} · ${Math.round(value/(total||1)*100)}%</strong></div>`).join('') || '<p class="form-hint">No active time for this date.</p>'}</div></div><div class="chart-note">Categories use a small local domain list. Unmatched domains stay Unknown.</div></div></div>
   <div class="card table-card"><div class="card-head"><div><h2>Recent internet activity</h2><p>A little context behind the connections</p></div><button class="button subtle" data-action="view" data-target="activity">View all ${icon('arrow')}</button></div>${activityTable(state.activity,5)}<div class="table-footer">Observed traffic does not confirm that a page was actively viewed. Encrypted content stays private.</div></div>
   <div class="bottom-grid"><div class="card card-pad"><div class="card-head"><div><h2>Worth a check-in</h2><p>Recent rule matches</p></div><button class="button subtle" data-action="view" data-target="alerts">All alerts ${icon('arrow')}</button></div>${recent.map(a=>`<div class="alert-preview"><div class="alert-symbol">${icon('bell')}</div><div class="alert-copy"><b>${esc(a.title)}</b><p>${esc(deviceName(a.device_ip))} · ${esc(a.domain || 'Daily usage')}</p><small>${clock(a.timestamp)} · ${esc(a.evidence)}</small></div></div>`).join('') || '<p class="form-hint">No open alerts for the selected date and device.</p>'}</div><div class="card card-pad insight-card"><div class="eyebrow">THE BIGGER PICTURE</div><h2>Good habits begin<br>with understanding.</h2><p>Use these observations to start a conversation. Internet time is an estimate; background traffic and buffered content can affect it.</p><button class="button subtle" data-action="view" data-target="rules">Review your family rules ${icon('arrow')}</button></div></div>`;
 }
+function serviceKey(row) {
+  return JSON.stringify([state.source, state.day, row.device_ip, row.service]);
+}
+function serviceTable(rows) {
+  if (!rows.length) return empty('No service activity in this view.', 'Only DNS lookups or background traffic may have been observed. Raw detail remains available below.');
+  return `<div class="table-wrap"><table><thead><tr><th>SERVICE</th><th>CATEGORY</th><th>ACTIVE TIME</th><th>LAST SEEN</th></tr></thead><tbody>${rows.map((row, index) => {
+    const key = serviceKey(row), expanded = expandedServices.has(key);
+    return `<tr><td><button class="text-button service-expand" data-action="service-detail" data-key="${esc(key)}" aria-expanded="${expanded}" aria-controls="service-detail-${index}">${expanded ? '▾' : '▸'} ${esc(row.service)}</button><small class="service-device">${esc(deviceName(row.device_ip))}</small></td><td>${categoryBadge(row.category)}</td><td>${duration(row.active_seconds)}</td><td>${clock(row.last)}</td></tr>
+    <tr id="service-detail-${index}" class="service-detail ${expanded ? '' : 'hidden'}"><td colspan="4"><table><thead><tr><th>DOMAIN / IP</th><th>EVIDENCE</th><th>PACKETS</th><th>LAST SEEN</th></tr></thead><tbody>${row.domains.map(domain => `<tr><td>${esc(domain.domain)}</td><td>${esc(domain.evidence)}</td><td>${domain.packets.toLocaleString()}</td><td>${clock(domain.last)}</td></tr>`).join('') || '<tr><td colspan="4">Session crosses this day; no packets were observed inside it.</td></tr>'}</tbody></table></td></tr>`;
+  }).join('')}</tbody></table></div>`;
+}
 function renderActivity() {
   if (!state) return;
+  const rawOpen = $('#raw-activity')?.open || false;
   const query = $('#activity-search').value.toLowerCase();
-  const rows = state.activity.filter(r => `${r.domain} ${deviceName(r.device_ip)} ${r.category}`.toLowerCase().includes(query));
-  $('#activity-content').innerHTML = `<div class="card">${activityTable(rows)}<div class="table-footer">${rows.length} grouped entries${rows.length>500?' · showing first 500':''}. Each entry groups a device, destination, and evidence type.</div></div><div class="callout"><b>Read the evidence:</b> DNS query = requested domain. TLS server name / HTTP Host = visible hostname. DNS-to-IP inference = estimated association that may be ambiguous on shared servers. IP connection = no domain identified. ${state.summary.unknown.toLocaleString()} observations have no visible domain.</div><div class="section-head"><div><h2>Internet activity sessions</h2><p>Payload traffic only. Known background exclusions apply.</p></div></div><div class="card table-wrap"><table><thead><tr><th>DEVICE</th><th>START</th><th>END</th><th>ESTIMATED TIME</th></tr></thead><tbody>${state.sessions.slice(0,100).map(s=>`<tr><td>${esc(deviceName(s.device_ip))}</td><td>${clock(s.start)}</td><td>${clock(s.end)}</td><td>${duration(s.seconds)}</td></tr>`).join('') || '<tr><td colspan="4">No payload activity sessions.</td></tr>'}</tbody></table></div>`;
+  const rows = state.services.filter(row => `${row.service} ${deviceName(row.device_ip)} ${row.category} ${row.domains.map(domain => domain.domain).join(' ')}`.toLowerCase().includes(query));
+  rows.sort((a, b) => b.active_seconds - a.active_seconds);
+  const raw = state.activity.filter(row => `${row.domain} ${deviceName(row.device_ip)} ${row.category}`.toLowerCase().includes(query));
+  $('#activity-content').innerHTML = `<div class="card">${serviceTable(rows)}<div class="table-footer">${rows.length} service entries. Expand a service to see domains and packet evidence.</div></div>
+    <p class="form-hint">Times for different services can overlap.</p>
+    <details id="raw-activity" class="card raw-activity" ${rawOpen ? 'open' : ''}><summary>Raw domain detail · includes background traffic and DNS lookups</summary>${activityTable(raw)}<div class="table-footer">${raw.length} grouped raw entries${raw.length > 500 ? ' · showing first 500' : ''}. DNS queries are lookups, not proof of usage.</div></details>
+    <div class="callout"><b>Read the evidence:</b> Service names are inferred from domains. DNS-to-IP inference can be ambiguous on shared servers. Unidentified connections have no visible domain. Opening a local PDF may produce no identifiable network activity.</div>
+    <div class="section-head"><div><h2>Internet activity sessions</h2><p>Whole-device timeline. Background-time settings apply.</p></div></div><div class="card table-wrap"><table><thead><tr><th>DEVICE</th><th>START</th><th>END</th><th>ESTIMATED TIME</th></tr></thead><tbody>${state.sessions.slice(0,100).map(session => `<tr><td>${esc(deviceName(session.device_ip))}</td><td>${clock(session.start)}</td><td>${clock(session.end)}</td><td>${duration(session.seconds)}</td></tr>`).join('') || '<tr><td colspan="4">No payload activity sessions.</td></tr>'}</tbody></table></div>`;
 }
+
 function renderAlerts() {
   $('#view-alerts').innerHTML = `<div class="section-head"><div><h2>${state.summary.unacknowledged} open ${state.summary.unacknowledged===1?'alert':'alerts'}</h2><p>Repeated matches are grouped by rule, device, destination, and day.</p></div><button class="button" data-action="view" data-target="rules">Manage rules</button></div>` + (state.alerts.length ? `<div class="alert-list">${state.alerts.map(a=>`<article class="card alert-card ${a.acknowledged?'acknowledged':''}"><span class="alert-symbol">${icon('bell')}</span><div class="alert-copy"><b>${esc(a.title)}</b><p>${esc(a.reason)}</p><p>${esc(deviceName(a.device_ip))} · ${clock(a.timestamp)}${a.last_seen!==a.timestamp?'–'+clock(a.last_seen):''} · ${a.count.toLocaleString()} ${a.count===1?'match':'matches'}</p><span class="evidence">Evidence: ${esc(a.evidence)}</span></div>${a.acknowledged?'<span class="badge success">Reviewed</span>':`<button class="button" data-action="ack" data-id="${esc(a.id)}">Mark reviewed</button>`}</article>`).join('')}</div>` : empty('Nothing needs a check-in.','No rules matched the selected activity. Missing capture coverage is not evidence that a device was offline.'));
 }
@@ -150,7 +175,7 @@ function renderCaptures() {
   zone.addEventListener('drop', event => { event.preventDefault(); zone.classList.remove('drag'); if(event.dataTransfer.files[0]) upload(event.dataTransfer.files[0]); });
 }
 function renderSettings() {
-  $('#view-settings').innerHTML = `<form class="card settings-card" id="settings-form"><h2>Internet-time estimation</h2><p class="form-hint">Count elapsed time between payload observations in each session. Isolated packets count as zero duration. Simultaneous apps on one device are merged.</p><div class="form-row"><label class="field">Session inactivity threshold (seconds)<input name="idle_seconds" type="number" min="30" max="600" value="${state.settings.idle_seconds}" required><small>A longer threshold bridges more quiet gaps.</small></label><label class="field">Local UTC offset (minutes)<input name="utc_offset" type="number" min="-720" max="840" value="${state.settings.utc_offset}" required><small>India: 330. UTC: 0. Fixed offset; adjust manually for daylight saving.</small></label></div><label class="field">Background domains excluded from time<textarea name="ignored_domains" rows="5">${esc(state.settings.ignored_domains.join('\n'))}</textarea><small>One domain per line. Subdomains are included. These observations remain in the activity log; only time estimation and permitted-hours rules exclude them.</small></label><div class="form-row"><label class="field">Metadata retention (days)<input name="retention_days" type="number" min="0" max="36500" value="${state.settings.retention_days}" required><small>Default 90. Zero keeps metadata forever.</small></label><label class="field">Raw capture storage<select name="keep_raw_captures"><option value="false" ${!state.settings.keep_raw_captures?'selected':''}>Delete after import</option><option value="true" ${state.settings.keep_raw_captures?'selected':''}>Keep in data/processed</option></select><small>Retained raw files can include payload. Remove them manually.</small></label></div><button class="button primary" type="submit">Save settings</button></form><div class="callout"><b>What the estimate means:</b> a connection is evidence of network activity, not human attention. Background services can inflate time; buffering and quiet reading can reduce it. DNS lookups, empty TCP packets, common local service traffic, and configured background domains do not extend sessions.<br><b>Data stays local:</b> uploaded raw files are parsed in memory. Only metadata is stored in SQLite. Captures created by the optional helper are deleted after successful import by default. Retention applies to event metadata and alerts; backups and kept raw files require manual cleanup.</div>`;
+  $('#view-settings').innerHTML = `<form class="card settings-card" id="settings-form"><h2>Internet-time estimation</h2><p class="form-hint">Count elapsed time between payload observations in each session. Isolated packets count as zero duration. Simultaneous apps on one device are merged.</p><div class="form-row"><label class="field">Session inactivity threshold (seconds)<input name="idle_seconds" type="number" min="30" max="600" value="${state.settings.idle_seconds}" required><small>A longer threshold bridges more quiet gaps.</small></label><label class="field">Local UTC offset (minutes)<input name="utc_offset" type="number" min="-720" max="840" value="${state.settings.utc_offset}" required><small>India: 330. UTC: 0. Fixed offset; adjust manually for daylight saving.</small></label></div><label class="field">Count catalog background traffic in time<select name="count_background_in_time"><option value="false" ${!state.settings.count_background_in_time?'selected':''}>No (recommended)</option><option value="true" ${state.settings.count_background_in_time?'selected':''}>Yes</option></select><small>Controls telemetry, ads and system traffic in time estimates and hours alerts. Showing background traffic in Activity does not change this setting.</small></label><label class="field">Background domains excluded from time<textarea name="ignored_domains" rows="5">${esc(state.settings.ignored_domains.join('\n'))}</textarea><small>One domain per line. Subdomains are included. These remain in raw detail and domain/category rules. They stay excluded from time even when counting catalog background is enabled.</small></label><div class="form-row"><label class="field">Metadata retention (days)<input name="retention_days" type="number" min="0" max="36500" value="${state.settings.retention_days}" required><small>Default 90. Zero keeps metadata forever.</small></label><label class="field">Raw capture storage<select name="keep_raw_captures"><option value="false" ${!state.settings.keep_raw_captures?'selected':''}>Delete after import</option><option value="true" ${state.settings.keep_raw_captures?'selected':''}>Keep in data/processed</option></select><small>Retained raw files can include payload. Remove them manually.</small></label></div><button class="button primary" type="submit">Save settings</button></form><div class="callout"><b>What the estimate means:</b> a connection is evidence of network activity, not human attention. Background services can inflate time; buffering and quiet reading can reduce it. DNS lookups, empty TCP packets, common local service traffic, and configured background domains do not extend sessions.<br><b>Data stays local:</b> uploaded raw files are parsed in memory. Only metadata is stored in SQLite. Captures created by the optional helper are deleted after successful import by default. Retention applies to event metadata and alerts; backups and kept raw files require manual cleanup.</div>`;
 }
 function render() { ({overview:renderOverview,activity:renderActivity,alerts:renderAlerts,rules:renderRules,devices:renderDevices,captures:renderCaptures,settings:renderSettings}[view])(); }
 
@@ -192,6 +217,15 @@ document.addEventListener('click',async event=>{
   const button=event.target.closest('[data-action]');if(!button)return;
   const {action,id,target}=button.dataset;
   try {
+    if(action==='service-detail') {
+      const key = button.dataset.key;
+      if (expandedServices.has(key)) expandedServices.delete(key);
+      else expandedServices.add(key);
+      renderActivity();
+      const replacement = [...document.querySelectorAll('[data-action="service-detail"]')].find(item => item.dataset.key === key);
+      replacement?.focus();
+      return;
+    }
     if(action==='view') {changeView(target);return;}
     if(action==='upload') {$('#file-input').click();return;}
     if(action==='new-rule'||action==='edit-rule') {openRule(id);return;}
@@ -207,7 +241,7 @@ document.addEventListener('submit',async event=>{
   event.preventDefault();const data=Object.fromEntries(new FormData(form)),button=form.querySelector('[type=submit]');button.disabled=true;
   try {
     if(form.dataset.device){await api('/devices/'+encodeURIComponent(form.dataset.device),{method:'PUT',body:JSON.stringify(data)});toast('Device details saved.');}
-    else{await api('/settings',{method:'PUT',body:JSON.stringify({keep_raw_captures:data.keep_raw_captures==='true',retention_days:Number(data.retention_days),idle_seconds:Number(data.idle_seconds),utc_offset:Number(data.utc_offset),ignored_domains:data.ignored_domains.split(/\r?\n/).map(s=>s.trim()).filter(Boolean)})});toast('Settings saved. Usage and alerts were recalculated.');}
+    else{await api('/settings',{method:'PUT',body:JSON.stringify({count_background_in_time:data.count_background_in_time==='true',keep_raw_captures:data.keep_raw_captures==='true',retention_days:Number(data.retention_days),idle_seconds:Number(data.idle_seconds),utc_offset:Number(data.utc_offset),ignored_domains:data.ignored_domains.split(/\r?\n/).map(s=>s.trim()).filter(Boolean)})});toast('Settings saved. Usage and alerts were recalculated.');}
     await refresh(true);
   }catch(error){toast(error.message,true);}finally{button.disabled=false;}
 });

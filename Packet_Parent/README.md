@@ -320,3 +320,11 @@ timeline, not packet counts. Times for different services can overlap. Category
 times can overlap too: neither sum is the device total. The device total still uses
 the single whole-device timeline. A lone payload observation has zero estimated
 duration; DNS lookups are not proof of use.
+
+Activity now opens with Service, Category, Active time and Last seen, sorted by
+active time. Each service expands to its domains/IPs, evidence and packet counts.
+The off-by-default Show background traffic toggle requests include_background;
+raw detail is separately expandable and always includes DNS and background.
+The overview chart uses category active time. Settings exposes the separate
+Count catalog background traffic in time control. Local PDFs may produce no
+network activity, so this view cannot confirm that a document was read.

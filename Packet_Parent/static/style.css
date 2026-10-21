@@ -8,3 +8,12 @@
 .monitor-panel{padding:20px 24px;margin-bottom:24px;display:flex;align-items:center;justify-content:space-between;gap:20px}.monitor-panel p{font-size:13px;margin:8px 0 0;max-width:650px}.monitor-controls{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.monitor-controls select{max-width:220px;padding:12px;border:1px solid #dce2d6;border-radius:8px;background:white}.filters{flex-wrap:wrap}#connection-error{color:#8b3024}@media(max-width:1000px){.monitor-panel{align-items:flex-start;flex-direction:column}}
 
 .badge.Productivity{background:#e0efed;color:#285e58}.badge.AI{background:#ece6f7;color:#58437d}
+
+.background-toggle{display:flex;align-items:center;gap:10px;margin:0 0 18px;cursor:pointer}
+.background-toggle input{width:18px;height:18px;accent-color:#245c4f}
+.service-device{display:block;color:var(--muted);margin-top:5px}
+.service-expand{text-align:left}
+.service-detail>td{background:#f7f9f5;padding:12px 24px}
+.service-detail table{width:100%}
+.raw-activity{margin-top:18px}
+.raw-activity>summary{cursor:pointer;padding:20px;font-weight:600}
